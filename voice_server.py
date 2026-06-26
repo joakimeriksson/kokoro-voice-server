@@ -9,8 +9,14 @@ generator so the client stays thin. Pick the engine at launch:
     # Piper (reuses this repo's Piper voices)
     python scripts/voice_server.py --engine piper  --voice en_US-lessac-medium
 
-    # Kokoro
+    # Kokoro (English + its other supported languages, NOT Swedish)
     python scripts/voice_server.py --engine kokoro --voice af_heart
+
+    # Swedish Kokoro — fine-tuned voice from the sibling swedish-kokoro project
+    # (torch-free ONNX model + espeak 'sv' g2p). Needs that project on disk plus:
+    #   pip install onnxruntime misaki phonemizer-fork espeakng_loader torch
+    SWEDISH_KOKORO_PATH=../ai-smarthome/swedish-kokoro \
+      python scripts/voice_server.py --engine kokoro-sv
 
 Then point the app at it (in .env):
 
@@ -22,6 +28,7 @@ Server tool only — lives outside ``src/`` so it never ships in the robot wheel
 """
 
 import io
+import os
 import sys
 import logging
 import argparse
@@ -81,6 +88,71 @@ class KokoroEngine:
         return 24000, pcm
 
 
+class SwedishKokoroEngine:
+    """Fine-tuned Swedish Kokoro via ONNX Runtime (torch-free model path).
+
+    Loads the model/voicepack/config + espeak 'sv' g2p from a sibling
+    ``swedish-kokoro`` project (see github.com/.../ai-smarthome). Point at it with
+    ``--svml-path`` or ``$SWEDISH_KOKORO_PATH``. Needs (in this env): onnxruntime,
+    misaki, phonemizer-fork, espeakng_loader, and torch (only to load the .pt
+    voicepack). The model itself runs in onnxruntime.
+    """
+
+    def __init__(self, svml_path: str) -> None:
+        import json
+
+        import onnxruntime as ort
+
+        path = Path(svml_path).expanduser().resolve()
+        if not path.is_dir():
+            raise SystemExit(f"--svml-path not found: {path}")
+        sys.path.insert(0, str(path))
+        try:
+            from sv_weights import resolve  # local deploy/ or HF auto-download
+        except ImportError as exc:  # pragma: no cover
+            raise SystemExit(f"swedish-kokoro not importable from {path}: {exc}")
+
+        self._vocab = json.load(open(resolve("config.json")))["vocab"]
+        self._voice = self._load_voicepack(resolve("sv_female.pt"))
+        self._session = ort.InferenceSession(resolve("kokoro_sv.onnx"), providers=["CPUExecutionProvider"])
+        from misaki import espeak
+
+        self._g2p = espeak.EspeakG2P(language="sv")
+
+    @staticmethod
+    def _load_voicepack(path: str) -> NDArray[np.float32]:
+        import torch
+
+        return torch.load(path, map_location="cpu", weights_only=True).numpy()
+
+    @staticmethod
+    def _trim_eos_tail(audio: NDArray[np.float32], pred_dur: Any, sr: int = 24000, fade_ms: int = 12) -> NDArray[np.float32]:
+        pd = np.asarray(pred_dur).astype(np.int64)
+        total = int(pd.sum())
+        if total <= 0:
+            return audio
+        spf = len(audio) / total
+        keep = max(1, min(int(round((total - int(pd[-1])) * spf)), len(audio)))
+        audio = audio[:keep].copy()
+        fade = int(fade_ms / 1000 * sr)
+        if 0 < fade < len(audio):
+            audio[-fade:] *= np.linspace(1.0, 0.0, fade).astype(audio.dtype)
+        return audio
+
+    def synth(self, text: str, voice: str | None) -> Tuple[int, NDArray[np.int16]]:
+        phonemes, _ = self._g2p(text)
+        ipa = phonemes.replace("ʏ", "y")
+        ids = [j for j in (self._vocab.get(p) for p in ipa) if j is not None]
+        if not ids:
+            return 24000, np.zeros(0, dtype=np.int16)
+        input_ids = np.array([[0, *ids, 0]], dtype=np.int64)
+        ref_s = self._voice[len(ids) - 1]
+        audio, pred_dur = self._session.run(None, {"input_ids": input_ids, "ref_s": ref_s})
+        audio = self._trim_eos_tail(np.asarray(audio).reshape(-1).astype(np.float32), pred_dur)
+        pcm = np.clip(audio * 32767.0, -32768, 32767).astype(np.int16)
+        return 24000, pcm
+
+
 def _to_audio_bytes(sample_rate: int, pcm: NDArray[np.int16], fmt: str) -> Tuple[bytes, str]:
     import soundfile as sf
 
@@ -123,17 +195,24 @@ def build_app(engine: Any) -> Any:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="OpenAI-compatible Piper/Kokoro voice server.")
-    p.add_argument("--engine", choices=["piper", "kokoro"], default="piper")
+    p.add_argument("--engine", choices=["piper", "kokoro", "kokoro-sv"], default="piper")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8880)
     p.add_argument("--voice", default=None, help="default voice (engine-specific)")
     p.add_argument("--voice-dir", default="piper_voices", help="Piper voices dir")
     p.add_argument("--lang", default="a", help="Kokoro lang_code (a=US English, b=UK, ...)")
+    p.add_argument(
+        "--svml-path",
+        default=os.environ.get("SWEDISH_KOKORO_PATH", "../ai-smarthome/swedish-kokoro"),
+        help="path to the swedish-kokoro project (for --engine kokoro-sv)",
+    )
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 
     if args.engine == "piper":
         engine: Any = PiperEngine(args.voice or "en_US-lessac-medium", args.voice_dir)
+    elif args.engine == "kokoro-sv":
+        engine = SwedishKokoroEngine(args.svml_path)
     else:
         engine = KokoroEngine(args.voice or "af_heart", args.lang)
     logger.info("Voice server: engine=%s on %s:%d", args.engine, args.host, args.port)
