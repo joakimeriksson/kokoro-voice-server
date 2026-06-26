@@ -163,7 +163,7 @@ class KokoroSVMLEngine:
     the swedish-kokoro deps (misaki, phonemizer-fork, espeakng_loader).
     """
 
-    def __init__(self, svml_path: str, lang: str = "sv") -> None:
+    def __init__(self, svml_path: str, lang: str = "sv", device: str | None = None) -> None:
         path = Path(svml_path).expanduser().resolve()
         if not path.is_dir():
             raise SystemExit(f"--svml-path not found: {path}")
@@ -172,10 +172,20 @@ class KokoroSVMLEngine:
             from kokoro_svml import KokoroSVML
         except ImportError as exc:  # pragma: no cover
             raise SystemExit(f"KokoroSVML not importable from {path}: {exc}")
-        self._tts = KokoroSVML()
+        import torch
+
+        if device is None:  # prefer GPU: cuda (3090) > mps (Apple Silicon) > cpu
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")  # a few TTS ops lack MPS kernels
+        self._tts = KokoroSVML(device=device)
         self._lang = lang
         backend = getattr(getattr(self._tts, "g2p_sv", None), "backend", "?")
-        logger.info("KokoroSVML ready: lang=%s, swedish g2p backend=%s", lang, backend)
+        logger.info("KokoroSVML ready: lang=%s, device=%s, swedish g2p backend=%s", lang, device, backend)
 
     def synth(self, text: str, voice: str | None) -> Tuple[int, NDArray[np.int16]]:
         audio = np.asarray(self._tts.generate(text, lang=self._lang, voice=voice or None), dtype=np.float32).reshape(-1)
@@ -211,12 +221,22 @@ def build_app(engine: Any) -> Any:
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    from reachy_local_assistant.audio.text_chunk import split_sentences
+
     @app.post("/v1/audio/speech")
     def speech(body: SpeechRequest) -> Response:
         text = (body.input or "").strip()
         if not text:
             return Response(content=b"", media_type="audio/wav")
-        sample_rate, pcm = engine.synth(text, body.voice)
+        # Chunk long text by sentence: Kokoro caps at ~510 tokens/utterance, and it
+        # keeps any single engine call small. Concatenate the PCM back into one WAV.
+        sample_rate = 24000
+        parts = []
+        for chunk in split_sentences(text) or [text]:
+            sample_rate, pcm = engine.synth(chunk, body.voice)
+            if len(pcm):
+                parts.append(pcm)
+        pcm = np.concatenate(parts) if parts else np.zeros(0, dtype=np.int16)
         audio, media = _to_audio_bytes(sample_rate, pcm, body.response_format)
         return Response(content=audio, media_type=media)
 
