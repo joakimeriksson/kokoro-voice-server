@@ -153,6 +153,36 @@ class SwedishKokoroEngine:
         return 24000, pcm
 
 
+class KokoroSVMLEngine:
+    """Torch KokoroSVML: Swedish + the other Kokoro languages in one model.
+
+    Wraps the swedish-kokoro project's ``KokoroSVML``. Its ``SwedishG2P``
+    auto-uses the **neural NST g2p** when that model is importable
+    (``SV_NEURAL_G2P`` / ``SV_G2P_DIR``) and falls back to espeak otherwise — the
+    active backend is logged at startup. Needs (in this env): kokoro, torch, and
+    the swedish-kokoro deps (misaki, phonemizer-fork, espeakng_loader).
+    """
+
+    def __init__(self, svml_path: str, lang: str = "sv") -> None:
+        path = Path(svml_path).expanduser().resolve()
+        if not path.is_dir():
+            raise SystemExit(f"--svml-path not found: {path}")
+        sys.path.insert(0, str(path))
+        try:
+            from kokoro_svml import KokoroSVML
+        except ImportError as exc:  # pragma: no cover
+            raise SystemExit(f"KokoroSVML not importable from {path}: {exc}")
+        self._tts = KokoroSVML()
+        self._lang = lang
+        backend = getattr(getattr(self._tts, "g2p_sv", None), "backend", "?")
+        logger.info("KokoroSVML ready: lang=%s, swedish g2p backend=%s", lang, backend)
+
+    def synth(self, text: str, voice: str | None) -> Tuple[int, NDArray[np.int16]]:
+        audio = np.asarray(self._tts.generate(text, lang=self._lang, voice=voice or None), dtype=np.float32).reshape(-1)
+        pcm = np.clip(audio * 32767.0, -32768, 32767).astype(np.int16)
+        return 24000, pcm
+
+
 def _to_audio_bytes(sample_rate: int, pcm: NDArray[np.int16], fmt: str) -> Tuple[bytes, str]:
     import soundfile as sf
 
@@ -195,7 +225,7 @@ def build_app(engine: Any) -> Any:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="OpenAI-compatible Piper/Kokoro voice server.")
-    p.add_argument("--engine", choices=["piper", "kokoro", "kokoro-sv"], default="piper")
+    p.add_argument("--engine", choices=["piper", "kokoro", "kokoro-sv", "kokoro-svml"], default="piper")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8880)
     p.add_argument("--voice", default=None, help="default voice (engine-specific)")
@@ -213,6 +243,8 @@ def main() -> None:
         engine: Any = PiperEngine(args.voice or "en_US-lessac-medium", args.voice_dir)
     elif args.engine == "kokoro-sv":
         engine = SwedishKokoroEngine(args.svml_path)
+    elif args.engine == "kokoro-svml":
+        engine = KokoroSVMLEngine(args.svml_path, lang="sv" if args.lang == "a" else args.lang)
     else:
         engine = KokoroEngine(args.voice or "af_heart", args.lang)
     logger.info("Voice server: engine=%s on %s:%d", args.engine, args.host, args.port)
