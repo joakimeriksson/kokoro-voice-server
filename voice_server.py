@@ -225,7 +225,10 @@ class KokoroSVMLEngine:
             lang = _detect_lang(text)
         else:
             lang = self._lang
-        audio = np.asarray(self._tts.generate(text, lang=lang, voice=voice or None), dtype=np.float32).reshape(-1)
+        # Only forward a real Kokoro voice (e.g. af_heart); ignore Piper/OpenAI names
+        # like "alloy" or "sv_SE-..." so KokoroSVML uses its per-language default.
+        kvoice = voice if (voice and _re.match(r"^[a-z][fm]_", voice)) else None
+        audio = np.asarray(self._tts.generate(text, lang=lang, voice=kvoice), dtype=np.float32).reshape(-1)
         pcm = np.clip(audio * 32767.0, -32768, 32767).astype(np.int16)
         return 24000, pcm
 
