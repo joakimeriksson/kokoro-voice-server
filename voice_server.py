@@ -47,6 +47,35 @@ from numpy.typing import NDArray
 
 logger = logging.getLogger("voice_server")
 
+# Cheap Swedish-vs-English guess so one KokoroSVML server can answer in whichever
+# language the user spoke (the model is multilingual). Defaults to English.
+import re as _re  # noqa: E402
+
+
+_SV_CHARS = set("åäöÅÄÖ")
+_SV_WORDS = {
+    "och", "är", "jag", "att", "det", "en", "ett", "vi", "du", "han", "hon",
+    "inte", "med", "för", "på", "som", "den", "har", "kan", "ska", "hej", "tack",
+}
+
+
+def _detect_lang(text: str) -> str:
+    """Return ``sv`` if the text looks Swedish, else ``en`` (for KokoroSVML routing)."""
+    if any(c in _SV_CHARS for c in text):
+        return "sv"
+    words = set(_re.findall(r"[a-zåäö]+", text.lower()))
+    return "sv" if words & _SV_WORDS else "en"
+
+
+# Languages KokoroSVML can speak; an unrecognised caller label falls back to detect.
+_SVML_LANGS = {"sv", "en", "en-us", "en-gb", "es", "fr", "hi", "it", "pt", "zh", "ja"}
+
+
+def _norm_lang(s: str | None) -> str:
+    """Normalise an STT/caller language label to a KokoroSVML code (best effort)."""
+    s = (s or "").strip().lower()
+    return {"swedish": "sv", "svenska": "sv", "se": "sv", "english": "en", "eng": "en"}.get(s, s)
+
 
 class PiperEngine:
     """Synthesise with this repo's Piper backend (offline, ONNX)."""
@@ -57,7 +86,7 @@ class PiperEngine:
         self._tts = PiperTTS(default_voice, data_dir)
         self._default = default_voice
 
-    def synth(self, text: str, voice: str | None) -> Tuple[int, NDArray[np.int16]]:
+    def synth(self, text: str, voice: str | None, language: str | None = None) -> Tuple[int, NDArray[np.int16]]:
         chunks = list(self._tts.synthesize(text, voice=voice or self._default))
         if not chunks:
             return 22050, np.zeros(0, dtype=np.int16)
@@ -76,7 +105,7 @@ class KokoroEngine:
         self._pipeline = KPipeline(lang_code=lang_code)
         self._default = default_voice
 
-    def synth(self, text: str, voice: str | None) -> Tuple[int, NDArray[np.int16]]:
+    def synth(self, text: str, voice: str | None, language: str | None = None) -> Tuple[int, NDArray[np.int16]]:
         parts = []
         for _gs, _ps, audio in self._pipeline(text, voice=voice or self._default):
             arr = audio.detach().cpu().numpy() if hasattr(audio, "detach") else np.asarray(audio)
@@ -139,7 +168,7 @@ class SwedishKokoroEngine:
             audio[-fade:] *= np.linspace(1.0, 0.0, fade).astype(audio.dtype)
         return audio
 
-    def synth(self, text: str, voice: str | None) -> Tuple[int, NDArray[np.int16]]:
+    def synth(self, text: str, voice: str | None, language: str | None = None) -> Tuple[int, NDArray[np.int16]]:
         phonemes, _ = self._g2p(text)
         ipa = phonemes.replace("ʏ", "y")
         ids = [j for j in (self._vocab.get(p) for p in ipa) if j is not None]
@@ -187,8 +216,16 @@ class KokoroSVMLEngine:
         backend = getattr(getattr(self._tts, "g2p_sv", None), "backend", "?")
         logger.info("KokoroSVML ready: lang=%s, device=%s, swedish g2p backend=%s", lang, device, backend)
 
-    def synth(self, text: str, voice: str | None) -> Tuple[int, NDArray[np.int16]]:
-        audio = np.asarray(self._tts.generate(text, lang=self._lang, voice=voice or None), dtype=np.float32).reshape(-1)
+    def synth(self, text: str, voice: str | None, language: str | None = None) -> Tuple[int, NDArray[np.int16]]:
+        # An explicit, recognised language from the caller (e.g. the STT-detected
+        # language) wins; otherwise auto-detect (--lang auto) or use the fixed lang.
+        if language and _norm_lang(language) in _SVML_LANGS:
+            lang = _norm_lang(language)
+        elif self._lang == "auto":
+            lang = _detect_lang(text)
+        else:
+            lang = self._lang
+        audio = np.asarray(self._tts.generate(text, lang=lang, voice=voice or None), dtype=np.float32).reshape(-1)
         pcm = np.clip(audio * 32767.0, -32768, 32767).astype(np.int16)
         return 24000, pcm
 
@@ -212,6 +249,7 @@ def build_app(engine: Any) -> Any:
 
         input: str
         voice: str | None = None
+        language: str | None = None
         model: str = ""
         response_format: str = "wav"
 
@@ -233,7 +271,7 @@ def build_app(engine: Any) -> Any:
         sample_rate = 24000
         parts = []
         for chunk in split_sentences(text) or [text]:
-            sample_rate, pcm = engine.synth(chunk, body.voice)
+            sample_rate, pcm = engine.synth(chunk, body.voice, body.language)
             if len(pcm):
                 parts.append(pcm)
         pcm = np.concatenate(parts) if parts else np.zeros(0, dtype=np.int16)
@@ -264,7 +302,7 @@ def main() -> None:
     elif args.engine == "kokoro-sv":
         engine = SwedishKokoroEngine(args.svml_path)
     elif args.engine == "kokoro-svml":
-        engine = KokoroSVMLEngine(args.svml_path, lang="sv" if args.lang == "a" else args.lang)
+        engine = KokoroSVMLEngine(args.svml_path, lang="auto" if args.lang == "a" else args.lang)
     else:
         engine = KokoroEngine(args.voice or "af_heart", args.lang)
     logger.info("Voice server: engine=%s on %s:%d", args.engine, args.host, args.port)
