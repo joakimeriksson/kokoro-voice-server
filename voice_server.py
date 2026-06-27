@@ -77,6 +77,35 @@ def _norm_lang(s: str | None) -> str:
     return {"swedish": "sv", "svenska": "sv", "se": "sv", "english": "en", "eng": "en"}.get(s, s)
 
 
+_SENT_BOUNDARY = _re.compile(r"(?<=[.!?…])\s+")
+
+
+def split_sentences(text: str, max_chars: int = 300) -> list:
+    """Split *text* into sentence chunks, hard-wrapping any over *max_chars*.
+
+    Inlined (not imported from the app) so this server runs in its own environment
+    without the reachy_local_assistant package. Keeps each chunk within Kokoro's
+    ~510-token per-utterance cap and enables low-latency per-sentence streaming.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    out = []
+    for piece in _SENT_BOUNDARY.split(text):
+        piece = piece.strip()
+        while len(piece) > max_chars:
+            cut = piece.rfind(" ", 0, max_chars)
+            if cut <= 0:
+                cut = max_chars
+            head = piece[:cut].strip()
+            if head:
+                out.append(head)
+            piece = piece[cut:].strip()
+        if piece:
+            out.append(piece)
+    return out
+
+
 class PiperEngine:
     """Synthesise with this repo's Piper backend (offline, ONNX)."""
 
@@ -261,8 +290,6 @@ def build_app(engine: Any) -> Any:
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
-
-    from reachy_local_assistant.audio.text_chunk import split_sentences
 
     @app.post("/v1/audio/speech")
     def speech(body: SpeechRequest) -> Response:
