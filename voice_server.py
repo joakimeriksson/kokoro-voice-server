@@ -59,8 +59,34 @@ _SV_WORDS = {
 }
 
 
+# Kokoro's languages, by lingua Language name -> Kokoro lang code.
+_LINGUA_TO_KOKORO = {
+    "SWEDISH": "sv", "ENGLISH": "en", "SPANISH": "es", "FRENCH": "fr",
+    "ITALIAN": "it", "PORTUGUESE": "pt", "HINDI": "hi", "CHINESE": "zh", "JAPANESE": "ja",
+}
+_lingua: Any = None  # lazily-built lingua detector (False if the dep is unavailable)
+
+
 def _detect_lang(text: str) -> str:
-    """Return ``sv`` if the text looks Swedish, else ``en`` (for KokoroSVML routing)."""
+    """Detect *text*'s language among Kokoro's set via lingua; default English.
+
+    Falls back to a cheap sv/en heuristic if lingua isn't installed. ~0.03 ms/call,
+    restricted to Kokoro's languages for accuracy on short replies.
+    """
+    global _lingua
+    if _lingua is None:
+        try:
+            from lingua import Language, LanguageDetectorBuilder
+
+            langs = [getattr(Language, name) for name in _LINGUA_TO_KOKORO]
+            _lingua = LanguageDetectorBuilder.from_languages(*langs).build()
+        except Exception:
+            _lingua = False
+    if _lingua:
+        detected = _lingua.detect_language_of(text)
+        if detected is not None:
+            return _LINGUA_TO_KOKORO.get(detected.name, "en")
+    # Fallback: sv-vs-en heuristic.
     if any(c in _SV_CHARS for c in text):
         return "sv"
     words = set(_re.findall(r"[a-zåäö]+", text.lower()))

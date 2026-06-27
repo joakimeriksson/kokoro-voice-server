@@ -18,4 +18,5 @@ dependencies = [
     "misaki",
     "phonemizer-fork",
     "espeakng-loader",
+    "lingua-language-detector",
 ]
