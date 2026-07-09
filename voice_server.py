@@ -12,9 +12,16 @@ generator so the client stays thin. Pick the engine at launch:
     # Kokoro (English + its other supported languages, NOT Swedish)
     python scripts/voice_server.py --engine kokoro --voice af_heart
 
-    # Swedish Kokoro — fine-tuned voice from the sibling swedish-kokoro project
-    # (torch-free ONNX model + espeak 'sv' g2p). Needs that project on disk plus:
-    #   pip install onnxruntime misaki phonemizer-fork espeakng_loader torch
+    # Multilingual: the finished fine-tuned Swedish + base Kokoro languages, one
+    # model. Named Swedish voice packs (Stina, Björn, Nils, …) and the neural
+    # Swedish g2p; auto-routes on the caller's / STT-detected language. Pulls the
+    # weights + voices from HF (--voices-repo, default Joakim/kokoro-sv-voices);
+    # needs the swedish-kokoro repo on disk for its g2p module, plus:
+    #   pip install kokoro torch scipy misaki phonemizer-fork espeakng_loader
+    SWEDISH_KOKORO_PATH=../ai-smarthome/swedish-kokoro \
+      python scripts/voice_server.py --engine kokoro-svml --voice Stina
+
+    # Swedish-only ONNX path (older single voice, espeak 'sv' g2p):
     SWEDISH_KOKORO_PATH=../ai-smarthome/swedish-kokoro \
       python scripts/voice_server.py --engine kokoro-sv
 
@@ -22,7 +29,7 @@ Then point the app at it (in .env):
 
     TTS_BACKEND=remote
     TTS_URL=http://<host>:8880/v1/audio/speech
-    TTS_VOICE=<a voice name for the chosen engine>
+    TTS_VOICE=<a voice name for the chosen engine, e.g. Stina for kokoro-svml>
 
 Server tool only — lives outside ``src/`` so it never ships in the robot wheel.
 """
@@ -238,25 +245,54 @@ class SwedishKokoroEngine:
 
 
 class KokoroSVMLEngine:
-    """Torch KokoroSVML: Swedish + the other Kokoro languages in one model.
+    """Multilingual Kokoro: the finished fine-tuned Swedish + base Kokoro langs.
 
-    Wraps the swedish-kokoro project's ``KokoroSVML``. Its ``SwedishG2P``
-    auto-uses the **neural NST g2p** when that model is importable
-    (``SV_NEURAL_G2P`` / ``SV_G2P_DIR``) and falls back to espeak otherwise — the
-    active backend is logged at startup. Needs (in this env): kokoro, torch, and
-    the swedish-kokoro deps (misaki, phonemizer-fork, espeakng_loader).
+    Self-contained port of the swedish-kokoro ``examples/speak.py`` recipe — it
+    does NOT wrap the sibling repo's ``KokoroSVML``; only its ``g2p_sv`` /
+    ``nst_g2p`` modules are imported (the neural Swedish grapheme->phoneme). The
+    fine-tuned weights and the **named voice packs** (Stina, Björn, Nils, …) are
+    pulled from the HF voices repo (``--voices-repo`` / ``$KOKORO_SV_VOICES``).
+
+    Swedish path: neural g2p -> KModel.forward_with_tokens -> four upsampler-tone
+    notch filters (2400/4800/7200/9600 Hz). Because Kokoro's KModel is
+    language-blind (IPA -> audio), the SAME weights serve the other languages via
+    a base ``KPipeline`` with a per-language default voice.
+
+    Needs (in this env): kokoro, torch, scipy, huggingface_hub, and the
+    swedish-kokoro repo on ``--svml-path`` (for its ``g2p_sv`` module).
     """
 
-    def __init__(self, svml_path: str, lang: str = "sv", device: str | None = None) -> None:
+    # lang -> (KPipeline lang_code, default base voice). Swedish handled separately.
+    _LANGS = {
+        "en": ("a", "af_heart"), "en-us": ("a", "af_heart"), "en-gb": ("b", "bf_emma"),
+        "es": ("e", "ef_dora"), "fr": ("f", "ff_siwis"), "hi": ("h", "hf_alpha"),
+        "it": ("i", "if_sara"), "pt": ("p", "pf_dora"), "zh": ("z", "zf_xiaobei"),
+        "ja": ("j", "jf_alpha"),
+    }
+    _NOTCH_HZ = (2400, 4800, 7200, 9600)  # remove the fine-tune upsampler tones (lossless)
+
+    def __init__(
+        self,
+        svml_path: str,
+        voices_repo: str,
+        default_sv_voice: str = "Stina",
+        lang: str = "sv",
+        allowed_langs: str = "sv,en",
+        device: str | None = None,
+    ) -> None:
         path = Path(svml_path).expanduser().resolve()
         if not path.is_dir():
             raise SystemExit(f"--svml-path not found: {path}")
-        sys.path.insert(0, str(path))
-        try:
-            from kokoro_svml import KokoroSVML
-        except ImportError as exc:  # pragma: no cover
-            raise SystemExit(f"KokoroSVML not importable from {path}: {exc}")
+        sys.path.insert(0, str(path))  # for `import g2p_sv`
+        os.environ.setdefault("SV_NEURAL_G2P", "nst_g2p")  # prefer the neural Swedish g2p
         import torch
+        from kokoro import KModel
+        from huggingface_hub import hf_hub_download
+
+        try:
+            from g2p_sv import SwedishG2P
+        except ImportError as exc:  # pragma: no cover
+            raise SystemExit(f"g2p_sv not importable from {path}: {exc}")
 
         if device is None:  # prefer GPU: cuda (3090) > mps (Apple Silicon) > cpu
             if torch.cuda.is_available():
@@ -266,25 +302,138 @@ class KokoroSVMLEngine:
             else:
                 device = "cpu"
         os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")  # a few TTS ops lack MPS kernels
-        self._tts = KokoroSVML(device=device)
+
+        self._torch = torch
+        self._device = device
+        self._voices_repo = voices_repo
+        self._default_sv_voice = default_sv_voice
         self._lang = lang
-        backend = getattr(getattr(self._tts, "g2p_sv", None), "backend", "?")
-        logger.info("KokoroSVML ready: lang=%s, device=%s, swedish g2p backend=%s", lang, device, backend)
+        # Allow-list: the robot only ever speaks these (default sv,en). Any stray
+        # STT-detected / auto-detected language outside it is clamped to _primary,
+        # so a mis-heard snippet can never make it wander into Hindi/Chinese/etc.
+        self._allowed = {_norm_lang(x) for x in allowed_langs.split(",") if x.strip()} or {"sv"}
+        self._primary = next((_norm_lang(x) for x in allowed_langs.split(",") if x.strip()), "sv")
+        cfg = hf_hub_download(voices_repo, "config.json")
+        wts = hf_hub_download(voices_repo, "kokoro_sv.pth")
+        self._model = KModel(repo_id="hexgrad/Kokoro-82M", config=cfg, model=wts).to(device).eval()
+        self._g2p = SwedishG2P(backend="neural")
+        self._sv_voices: dict[str, Any] = {}  # name -> voicepack tensor (lazy, cached)
+        self._pipes: dict[str, Any] = {}  # KPipeline lang_code -> pipeline (lazy, cached)
+        backend = getattr(self._g2p, "backend", "?")
+        logger.info(
+            "KokoroSVML ready: device=%s, swedish g2p=%s, voices=%s, default sv voice=%s, langs=%s (primary %s)",
+            device, backend, voices_repo, default_sv_voice, sorted(self._allowed), self._primary,
+        )
+
+    def _sv_voicepack(self, name: str) -> Any:
+        """Lazily fetch+cache the ``voices/<name>.pt`` pack from the voices repo."""
+        if name not in self._sv_voices:
+            from huggingface_hub import hf_hub_download
+
+            p = hf_hub_download(self._voices_repo, f"voices/{name}.pt")
+            self._sv_voices[name] = self._torch.load(p, map_location=self._device, weights_only=True)
+        return self._sv_voices[name]
+
+    def _pipe(self, code: str) -> Any:
+        """Lazily build a base-Kokoro ``KPipeline`` for a non-Swedish lang code."""
+        if code not in self._pipes:
+            from kokoro import KPipeline
+
+            self._pipes[code] = KPipeline(lang_code=code, repo_id="hexgrad/Kokoro-82M", model=self._model)
+        return self._pipes[code]
+
+    def _notch(self, audio: NDArray[np.float32]) -> NDArray[np.float32]:
+        from scipy.signal import iirnotch, filtfilt
+
+        for f0 in self._NOTCH_HZ:
+            b, a = iirnotch(f0, Q=35, fs=24000)
+            audio = filtfilt(b, a, audio)
+        return audio.astype(np.float32)
+
+    @staticmethod
+    def _trim_silence(
+        audio: NDArray[np.float32], sr: int = 24000, pad_ms: int = 40, hop_ms: int = 10
+    ) -> NDArray[np.float32]:
+        """Strip leading/trailing near-silence, keeping a short pad + edge fades.
+
+        The model pads each utterance with long BOS/EOS pauses (a bare "Hej!" is
+        ~1.1 s of leading + ~0.9 s of trailing silence around 0.4 s of speech).
+        The server synthesises one utterance per sentence and concatenates them,
+        so those pauses would pile up into big gaps. Trim to the voiced region.
+        """
+        if audio.size == 0:
+            return audio
+        peak = float(np.abs(audio).max())
+        if peak <= 0.0:
+            return audio
+        hop = max(1, int(hop_ms / 1000 * sr))
+        frames = audio[: len(audio) // hop * hop].reshape(-1, hop)
+        env = np.sqrt((frames.astype(np.float64) ** 2).mean(axis=1))
+        thr = max(0.02 * peak, 1e-4)  # 2% of peak, with an absolute floor
+        voiced = np.where(env > thr)[0]
+        if voiced.size == 0:
+            return audio
+        pad = int(pad_ms / 1000 * sr)
+        start = max(0, voiced[0] * hop - pad)
+        end = min(len(audio), (voiced[-1] + 1) * hop + pad)
+        out = audio[start:end].copy()
+        fade = int(0.008 * sr)  # 8 ms in/out fade to avoid clicks at the cut
+        if 0 < fade < len(out):
+            out[:fade] *= np.linspace(0.0, 1.0, fade).astype(out.dtype)
+            out[-fade:] *= np.linspace(1.0, 0.0, fade).astype(out.dtype)
+        return out
+
+    def _synth_sv(self, text: str, voice: str | None) -> NDArray[np.float32]:
+        # A base-Kokoro-style name (af_heart) isn't a Swedish pack -> use the default.
+        name = voice if (voice and not _re.match(r"^[a-z][fm]_", voice)) else self._default_sv_voice
+        try:
+            vp = self._sv_voicepack(name)
+        except Exception:
+            logger.warning("swedish voice %r not found in %s; using %s", name, self._voices_repo, self._default_sv_voice)
+            vp = self._sv_voicepack(self._default_sv_voice)
+        ipa = self._g2p(text).replace("ʏ", "y")
+        ids = [i for i in (self._model.vocab.get(p) for p in ipa) if i is not None]
+        if not ids:
+            return np.zeros(0, dtype=np.float32)
+        torch = self._torch
+        with torch.no_grad():
+            audio_t, _pred_dur = self._model.forward_with_tokens(
+                torch.LongTensor([[0, *ids, 0]]).to(self._device),
+                vp[len(ids) - 1].to(self._device),
+                speed=1.0,
+            )
+        audio = self._notch(audio_t.squeeze().cpu().numpy().astype(np.float32))
+        return self._trim_silence(audio)
+
+    def _synth_other(self, text: str, lang: str, voice: str | None) -> NDArray[np.float32]:
+        code, default_voice = self._LANGS.get(lang, self._LANGS["en"])
+        # Only forward a real base-Kokoro voice (af_heart); ignore Swedish/Piper/OpenAI
+        # names so each language uses its own default voice.
+        kvoice = voice if (voice and _re.match(r"^[a-z][fm]_", voice)) else default_voice
+        chunks = [
+            a.detach().cpu().numpy() if hasattr(a, "detach") else np.asarray(a)
+            for _gs, _ps, a in self._pipe(code)(text, voice=kvoice)
+        ]
+        return np.concatenate(chunks).astype(np.float32) if chunks else np.zeros(0, dtype=np.float32)
 
     def synth(self, text: str, voice: str | None, language: str | None = None) -> Tuple[int, NDArray[np.int16]]:
-        # An explicit, recognised language from the caller (e.g. the STT-detected
+        # An explicit, allowed language from the caller (e.g. the STT-detected
         # language) wins; otherwise auto-detect (--lang auto) or use the fixed lang.
-        if language and _norm_lang(language) in _SVML_LANGS:
+        if language and _norm_lang(language) in self._allowed:
             lang = _norm_lang(language)
         elif self._lang == "auto":
             lang = _detect_lang(text)
         else:
             lang = self._lang
-        # Only forward a real Kokoro voice (e.g. af_heart); ignore Piper/OpenAI names
-        # like "alloy" or "sv_SE-..." so KokoroSVML uses its per-language default.
-        kvoice = voice if (voice and _re.match(r"^[a-z][fm]_", voice)) else None
-        audio = np.asarray(self._tts.generate(text, lang=lang, voice=kvoice), dtype=np.float32).reshape(-1)
-        pcm = np.clip(audio * 32767.0, -32768, 32767).astype(np.int16)
+        # Clamp to the allow-list: a mis-heard snippet must never make the robot
+        # speak a language it isn't supposed to (this is what caused the Hindi).
+        if lang not in self._allowed:
+            lang = self._primary
+        if lang in ("sv", "swedish", "se"):
+            audio = self._synth_sv(text, voice)
+        else:
+            audio = self._synth_other(text, lang, voice)
+        pcm = np.clip(audio.reshape(-1) * 32767.0, -32768, 32767).astype(np.int16)
         return 24000, pcm
 
 
@@ -348,7 +497,18 @@ def main() -> None:
     p.add_argument(
         "--svml-path",
         default=os.environ.get("SWEDISH_KOKORO_PATH", "../ai-smarthome/swedish-kokoro"),
-        help="path to the swedish-kokoro project (for --engine kokoro-sv)",
+        help="path to the swedish-kokoro project (for --engine kokoro-sv / kokoro-svml g2p)",
+    )
+    p.add_argument(
+        "--voices-repo",
+        default=os.environ.get("KOKORO_SV_VOICES", "Joakim/kokoro-sv-voices"),
+        help="HF repo with the finished Swedish model + named voice packs (--engine kokoro-svml)",
+    )
+    p.add_argument(
+        "--langs",
+        default=os.environ.get("KOKORO_SV_LANGS", "sv,en"),
+        help="kokoro-svml allow-list of spoken languages (first = primary/fallback); "
+        "any detected language outside it is clamped so the robot never wanders off",
     )
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
@@ -358,7 +518,13 @@ def main() -> None:
     elif args.engine == "kokoro-sv":
         engine = SwedishKokoroEngine(args.svml_path)
     elif args.engine == "kokoro-svml":
-        engine = KokoroSVMLEngine(args.svml_path, lang="auto" if args.lang == "a" else args.lang)
+        engine = KokoroSVMLEngine(
+            args.svml_path,
+            voices_repo=args.voices_repo,
+            default_sv_voice=args.voice or "Stina",
+            lang="auto" if args.lang == "a" else args.lang,
+            allowed_langs=args.langs,
+        )
     else:
         engine = KokoroEngine(args.voice or "af_heart", args.lang)
     logger.info("Voice server: engine=%s on %s:%d", args.engine, args.host, args.port)
