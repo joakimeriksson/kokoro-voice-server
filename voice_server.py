@@ -447,8 +447,38 @@ def _to_audio_bytes(sample_rate: int, pcm: NDArray[np.int16], fmt: str) -> Tuple
     return buf.getvalue(), media
 
 
-def build_app(engine: Any) -> Any:
-    from fastapi import FastAPI, Response
+class WhisperSTT:
+    """faster-whisper transcription (CPU int8) for /v1/audio/transcriptions.
+
+    Lets the app keep a TEXT conversation history without a second gemma call: in
+    direct-audio mode the app fires this AFTER the LLM has replied (off the reply's
+    critical path), and stores the returned transcript instead of the raw audio.
+    Small multilingual Whisper (base) auto-detects the language; runs on CPU so it
+    never contends with Ollama on the GPU.
+    """
+
+    def __init__(self, model_size: str = "base", initial_prompt: str | None = "Reachy Mini, a small friendly robot.") -> None:
+        from faster_whisper import WhisperModel
+
+        self._model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        self._initial_prompt = initial_prompt
+        logger.info("Whisper STT ready: %s (cpu/int8)", model_size)
+
+    def transcribe(self, audio_bytes: bytes, language: str | None = None) -> Tuple[str, str]:
+        """Return (text, detected_language). faster-whisper decodes+resamples internally."""
+        segments, info = self._model.transcribe(
+            io.BytesIO(audio_bytes),
+            beam_size=1,  # greedy = fastest
+            language=language or None,
+            initial_prompt=self._initial_prompt,
+        )
+        text = " ".join(s.text.strip() for s in segments).strip()
+        return text, info.language
+
+
+def build_app(engine: Any, stt: Any = None) -> Any:
+    from fastapi import FastAPI, Response, UploadFile, File, Form
+    from fastapi.responses import JSONResponse
     from pydantic import BaseModel
 
     class SpeechRequest(BaseModel):
@@ -483,6 +513,21 @@ def build_app(engine: Any) -> Any:
         audio, media = _to_audio_bytes(sample_rate, pcm, body.response_format)
         return Response(content=audio, media_type=media)
 
+    @app.post("/v1/audio/transcriptions")
+    async def transcriptions(
+        file: UploadFile = File(...),
+        model: str = Form(""),
+        language: str | None = Form(None),
+    ) -> Any:
+        """OpenAI-compatible Whisper transcription: multipart file -> {text, language}."""
+        if stt is None:
+            return JSONResponse({"error": "transcription not enabled (start with --whisper)"}, status_code=501)
+        data = await file.read()
+        if not data:
+            return {"text": "", "language": language or ""}
+        text, lang = stt.transcribe(data, language=language)
+        return {"text": text, "language": lang}
+
     return app
 
 
@@ -510,6 +555,11 @@ def main() -> None:
         help="kokoro-svml allow-list of spoken languages (first = primary/fallback); "
         "any detected language outside it is clamped so the robot never wanders off",
     )
+    p.add_argument(
+        "--whisper",
+        default=os.environ.get("WHISPER_MODEL", "off"),
+        help="faster-whisper size for /v1/audio/transcriptions (tiny/base/small/medium), or 'off'",
+    )
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 
@@ -527,11 +577,17 @@ def main() -> None:
         )
     else:
         engine = KokoroEngine(args.voice or "af_heart", args.lang)
-    logger.info("Voice server: engine=%s on %s:%d", args.engine, args.host, args.port)
+
+    stt = None
+    if args.whisper and args.whisper.lower() != "off":
+        stt = WhisperSTT(args.whisper)
+    logger.info(
+        "Voice server: engine=%s whisper=%s on %s:%d", args.engine, args.whisper, args.host, args.port
+    )
 
     import uvicorn
 
-    uvicorn.run(build_app(engine), host=args.host, port=args.port)
+    uvicorn.run(build_app(engine, stt), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

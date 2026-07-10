@@ -20,4 +20,6 @@ dependencies = [
     "phonemizer-fork",
     "espeakng-loader",
     "lingua-language-detector",
+    "faster-whisper",   # /v1/audio/transcriptions (Whisper STT, CPU int8)
+    "python-multipart",  # FastAPI Form/File for the transcription endpoint
 ]
