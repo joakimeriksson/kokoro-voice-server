@@ -1,13 +1,10 @@
-"""OpenAI-compatible voice server (/v1/audio/speech) — Piper or Kokoro.
+"""OpenAI-compatible voice server: Kokoro TTS + Whisper STT.
 
-Lets reachy_local_assistant (``TTS_BACKEND=remote``) use a network voice
-generator so the client stays thin. Pick the engine at launch:
+Serves ``/v1/audio/speech`` (TTS) and ``/v1/audio/transcriptions`` (Whisper), so
+reachy_local_assistant stays thin — the models live here. Run it from its own
+environment (``cd voice-server && uv sync``); see voice-server/README.md.
 
-    pip install '.[voiceserver]'                 # fastapi + uvicorn (Piper engine)
-    # for the kokoro engine also: pip install kokoro
-
-    # Piper (reuses this repo's Piper voices)
-    python scripts/voice_server.py --engine piper  --voice en_US-lessac-medium
+Pick the engine at launch:
 
     # Kokoro (English + its other supported languages, NOT Swedish)
     python scripts/voice_server.py --engine kokoro --voice af_heart
@@ -25,11 +22,14 @@ generator so the client stays thin. Pick the engine at launch:
     SWEDISH_KOKORO_PATH=../ai-smarthome/swedish-kokoro \
       python scripts/voice_server.py --engine kokoro-sv
 
+Add ``--whisper base`` (or tiny/small/medium) to enable transcription, which the
+app uses to store text rather than raw audio in the conversation history.
+
 Then point the app at it (in .env):
 
-    TTS_BACKEND=remote
     TTS_URL=http://<host>:8880/v1/audio/speech
     TTS_VOICE=<a voice name for the chosen engine, e.g. Stina for kokoro-svml>
+    STT_URL=http://<host>:8880/v1/audio/transcriptions   # defaults to the TTS host
 
 Server tool only — lives outside ``src/`` so it never ships in the robot wheel.
 """
@@ -41,12 +41,6 @@ import logging
 import argparse
 from typing import Any, Tuple
 from pathlib import Path
-
-
-# Make the in-repo package importable (used by the Piper engine).
-_SRC = Path(__file__).resolve().parents[1] / "src"
-if _SRC.is_dir() and str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
 
 import numpy as np
 from numpy.typing import NDArray
@@ -74,11 +68,21 @@ _LINGUA_TO_KOKORO = {
 _lingua: Any = None  # lazily-built lingua detector (False if the dep is unavailable)
 
 
-def _detect_lang(text: str) -> str:
-    """Detect *text*'s language among Kokoro's set via lingua; default English.
+# Below this detector confidence, one utterance is not enough to decide: prefer the
+# caller's conversation-history hint. Measured on short replies — genuine misses
+# ("Absolut." -> fr at 0.29, "Sure!" -> fr at 0.39) all sit under 0.40 with a ~0.03
+# margin, while correct calls on a real sentence are >= 0.53.
+HINT_MIN_CONFIDENCE = 0.5
 
-    Falls back to a cheap sv/en heuristic if lingua isn't installed. ~0.03 ms/call,
-    restricted to Kokoro's languages for accuracy on short replies.
+
+def _detect_lang(text: str) -> Tuple[str, float]:
+    """Detect *text*'s language among Kokoro's set; return ``(lang, confidence)``.
+
+    Uses lingua, restricted to Kokoro's languages for accuracy (~0.03 ms/call),
+    falling back to a cheap sv/en heuristic when it isn't installed. The confidence
+    matters as much as the guess: a short reply like "Ja!" or "Sure!" carries almost
+    no signal, so the caller uses it to decide whether to trust the conversation's
+    language instead (see ``HINT_MIN_CONFIDENCE``).
     """
     global _lingua
     if _lingua is None:
@@ -90,14 +94,16 @@ def _detect_lang(text: str) -> str:
         except Exception:
             _lingua = False
     if _lingua:
-        detected = _lingua.detect_language_of(text)
-        if detected is not None:
-            return _LINGUA_TO_KOKORO.get(detected.name, "en")
-    # Fallback: sv-vs-en heuristic.
+        ranked = _lingua.compute_language_confidence_values(text)
+        if ranked:
+            best = ranked[0]
+            return _LINGUA_TO_KOKORO.get(best.language.name, "en"), float(best.value)
+    # Fallback: sv-vs-en heuristic. Swedish glyphs are near-conclusive; a word-list
+    # hit is weak enough that the hint should win.
     if any(c in _SV_CHARS for c in text):
-        return "sv"
+        return "sv", 0.9
     words = set(_re.findall(r"[a-zåäö]+", text.lower()))
-    return "sv" if words & _SV_WORDS else "en"
+    return ("sv", 0.4) if words & _SV_WORDS else ("en", 0.4)
 
 
 # Languages KokoroSVML can speak; an unrecognised caller label falls back to detect.
@@ -139,23 +145,6 @@ def split_sentences(text: str, max_chars: int = 300) -> list:
     return out
 
 
-class PiperEngine:
-    """Synthesise with this repo's Piper backend (offline, ONNX)."""
-
-    def __init__(self, default_voice: str, data_dir: str) -> None:
-        from reachy_local_assistant.audio.piper_tts import PiperTTS
-
-        self._tts = PiperTTS(default_voice, data_dir)
-        self._default = default_voice
-
-    def synth(self, text: str, voice: str | None, language: str | None = None) -> Tuple[int, NDArray[np.int16]]:
-        chunks = list(self._tts.synthesize(text, voice=voice or self._default))
-        if not chunks:
-            return 22050, np.zeros(0, dtype=np.int16)
-        sample_rate = chunks[0][0]
-        return sample_rate, np.concatenate([c[1] for c in chunks])
-
-
 class KokoroEngine:
     """Synthesise with Kokoro (hexgrad/Kokoro-82M), 24 kHz float audio."""
 
@@ -166,10 +155,32 @@ class KokoroEngine:
             raise SystemExit("Kokoro engine needs: pip install kokoro") from exc
         self._pipeline = KPipeline(lang_code=lang_code)
         self._default = default_voice
+        self.default_voice = default_voice  # reported by /health
 
-    def synth(self, text: str, voice: str | None, language: str | None = None) -> Tuple[int, NDArray[np.int16]]:
+    def _resolve_voice(self, voice: str | None) -> str:
+        """Return a usable base-Kokoro voice, falling back to the default.
+
+        Base Kokoro voices are all ``<lang><gender>_<name>`` (af_heart, bm_george).
+        Anything else — most often a Swedish pack name like "Stina" left over from
+        a kokoro-svml config — is not downloadable here and would make every
+        request 500, i.e. a robot that hears you and then says nothing. Warn and
+        speak in the default voice instead; wrong voice beats no voice.
+        """
+        if voice and _re.match(r"^[a-z][fm]_", voice):
+            return voice
+        if voice:
+            logger.warning(
+                "voice %r is not a base-Kokoro voice (expected e.g. af_heart); using %r. "
+                "Swedish voice packs need --engine kokoro-svml.",
+                voice, self._default,
+            )
+        return self._default
+
+    def synth(
+        self, text: str, voice: str | None, language: str | None = None, language_hint: str | None = None
+    ) -> Tuple[int, NDArray[np.int16]]:
         parts = []
-        for _gs, _ps, audio in self._pipeline(text, voice=voice or self._default):
+        for _gs, _ps, audio in self._pipeline(text, voice=self._resolve_voice(voice)):
             arr = audio.detach().cpu().numpy() if hasattr(audio, "detach") else np.asarray(audio)
             parts.append(arr.astype(np.float32).reshape(-1))
         if not parts:
@@ -230,7 +241,9 @@ class SwedishKokoroEngine:
             audio[-fade:] *= np.linspace(1.0, 0.0, fade).astype(audio.dtype)
         return audio
 
-    def synth(self, text: str, voice: str | None, language: str | None = None) -> Tuple[int, NDArray[np.int16]]:
+    def synth(
+        self, text: str, voice: str | None, language: str | None = None, language_hint: str | None = None
+    ) -> Tuple[int, NDArray[np.int16]]:
         phonemes, _ = self._g2p(text)
         ipa = phonemes.replace("ʏ", "y")
         ids = [j for j in (self._vocab.get(p) for p in ipa) if j is not None]
@@ -307,6 +320,7 @@ class KokoroSVMLEngine:
         self._device = device
         self._voices_repo = voices_repo
         self._default_sv_voice = default_sv_voice
+        self.default_voice = default_sv_voice  # reported by /health
         self._lang = lang
         # Allow-list: the robot only ever speaks these (default sv,en). Any stray
         # STT-detected / auto-detected language outside it is clamped to _primary,
@@ -343,7 +357,7 @@ class KokoroSVMLEngine:
         return self._pipes[code]
 
     def _notch(self, audio: NDArray[np.float32]) -> NDArray[np.float32]:
-        from scipy.signal import iirnotch, filtfilt
+        from scipy.signal import filtfilt, iirnotch
 
         for f0 in self._NOTCH_HZ:
             b, a = iirnotch(f0, Q=35, fs=24000)
@@ -416,19 +430,34 @@ class KokoroSVMLEngine:
         ]
         return np.concatenate(chunks).astype(np.float32) if chunks else np.zeros(0, dtype=np.float32)
 
-    def synth(self, text: str, voice: str | None, language: str | None = None) -> Tuple[int, NDArray[np.int16]]:
+    def synth(
+        self, text: str, voice: str | None, language: str | None = None, language_hint: str | None = None
+    ) -> Tuple[int, NDArray[np.int16]]:
+        hint = _norm_lang(language_hint)
+        hint = hint if hint in self._allowed else ""
         # An explicit, allowed language from the caller (e.g. the STT-detected
         # language) wins; otherwise auto-detect (--lang auto) or use the fixed lang.
         if language and _norm_lang(language) in self._allowed:
             lang = _norm_lang(language)
         elif self._lang == "auto":
-            lang = _detect_lang(text)
+            lang, confidence = _detect_lang(text)
+            # One short utterance ("Ja!", "Absolut.", "Sure!") carries almost no
+            # signal, and with several languages allowed it lands on the wrong one
+            # often enough to be audible. When the detector is unsure, the
+            # conversation so far is the better evidence than this fragment.
+            if hint and confidence < HINT_MIN_CONFIDENCE and hint != lang:
+                logger.info(
+                    "lang %s (%.2f) below %.2f for %r — using conversation hint %s",
+                    lang, confidence, HINT_MIN_CONFIDENCE, text[:40], hint,
+                )
+                lang = hint
         else:
             lang = self._lang
         # Clamp to the allow-list: a mis-heard snippet must never make the robot
         # speak a language it isn't supposed to (this is what caused the Hindi).
+        # The conversation's own language beats the static primary here too.
         if lang not in self._allowed:
-            lang = self._primary
+            lang = hint or self._primary
         if lang in ("sv", "swedish", "se"):
             audio = self._synth_sv(text, voice)
         else:
@@ -477,24 +506,42 @@ class WhisperSTT:
 
 
 def build_app(engine: Any, stt: Any = None) -> Any:
-    from fastapi import FastAPI, Response, UploadFile, File, Form
-    from fastapi.responses import JSONResponse
+    from fastapi import File, Form, FastAPI, Response, UploadFile
     from pydantic import BaseModel
+    from fastapi.responses import JSONResponse
 
     class SpeechRequest(BaseModel):
         """OpenAI /v1/audio/speech request body (extra fields ignored)."""
 
         input: str
         voice: str | None = None
+        # Authoritative: speak exactly this language (e.g. the STT-detected one).
         language: str | None = None
+        # Advisory: the conversation's language so far. Used only to break ties
+        # when detecting this utterance alone is unreliable — never overrides
+        # `language`, nor a confident detection (so switching language mid-chat
+        # still works as soon as the user says a full sentence in it).
+        language_hint: str | None = None
         model: str = ""
         response_format: str = "wav"
 
     app = FastAPI(title="reachy_local_assistant voice server")
 
     @app.get("/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    def health() -> dict[str, Any]:
+        """Report what this server can actually do, not just that it is up.
+
+        The app probes this at startup. "Reachable but transcription disabled"
+        is otherwise a silent failure: the conversation works while the text
+        history quietly keeps raw audio instead of transcripts.
+        """
+        return {
+            "status": "ok",
+            "engine": type(engine).__name__,
+            "default_voice": getattr(engine, "default_voice", "") or "",
+            "tts": True,
+            "stt": stt is not None,
+        }
 
     @app.post("/v1/audio/speech")
     def speech(body: SpeechRequest) -> Response:
@@ -506,7 +553,7 @@ def build_app(engine: Any, stt: Any = None) -> Any:
         sample_rate = 24000
         parts = []
         for chunk in split_sentences(text) or [text]:
-            sample_rate, pcm = engine.synth(chunk, body.voice, body.language)
+            sample_rate, pcm = engine.synth(chunk, body.voice, body.language, body.language_hint)
             if len(pcm):
                 parts.append(pcm)
         pcm = np.concatenate(parts) if parts else np.zeros(0, dtype=np.int16)
@@ -532,12 +579,11 @@ def build_app(engine: Any, stt: Any = None) -> Any:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="OpenAI-compatible Piper/Kokoro voice server.")
-    p.add_argument("--engine", choices=["piper", "kokoro", "kokoro-sv", "kokoro-svml"], default="piper")
+    p = argparse.ArgumentParser(description="OpenAI-compatible Kokoro voice server (TTS + Whisper STT).")
+    p.add_argument("--engine", choices=["kokoro", "kokoro-sv", "kokoro-svml"], default="kokoro")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8880)
     p.add_argument("--voice", default=None, help="default voice (engine-specific)")
-    p.add_argument("--voice-dir", default="piper_voices", help="Piper voices dir")
     p.add_argument("--lang", default="a", help="Kokoro lang_code (a=US English, b=UK, ...)")
     p.add_argument(
         "--svml-path",
@@ -551,9 +597,11 @@ def main() -> None:
     )
     p.add_argument(
         "--langs",
-        default=os.environ.get("KOKORO_SV_LANGS", "sv,en"),
+        default=os.environ.get("KOKORO_SV_LANGS", "sv,en,fr,es,it"),
         help="kokoro-svml allow-list of spoken languages (first = primary/fallback); "
-        "any detected language outside it is clamped so the robot never wanders off",
+        "any detected language outside it is clamped so the robot never wanders off. "
+        "An allowed non-Swedish language is spoken by base Kokoro with ITS OWN voice "
+        "(fr -> ff_siwis), not the Swedish pack — only 'sv' uses the fine-tuned voices",
     )
     p.add_argument(
         "--whisper",
@@ -563,10 +611,8 @@ def main() -> None:
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 
-    if args.engine == "piper":
-        engine: Any = PiperEngine(args.voice or "en_US-lessac-medium", args.voice_dir)
-    elif args.engine == "kokoro-sv":
-        engine = SwedishKokoroEngine(args.svml_path)
+    if args.engine == "kokoro-sv":
+        engine: Any = SwedishKokoroEngine(args.svml_path)
     elif args.engine == "kokoro-svml":
         engine = KokoroSVMLEngine(
             args.svml_path,
