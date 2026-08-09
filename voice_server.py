@@ -494,12 +494,19 @@ class WhisperSTT:
         logger.info("Whisper STT ready: %s (cpu/int8)", model_size)
 
     def transcribe(self, audio_bytes: bytes, language: str | None = None) -> Tuple[str, str]:
-        """Return (text, detected_language). faster-whisper decodes+resamples internally."""
+        """Return (text, detected_language). faster-whisper decodes+resamples internally.
+
+        ``vad_filter`` strips non-speech before decoding. Without it, Whisper
+        *hallucinates* on noise-only audio — a chair scrape comes back as a
+        plausible sentence — which breaks the app's noise gate (it drops turns
+        whose transcript is empty, so noise must actually produce empty text).
+        """
         segments, info = self._model.transcribe(
             io.BytesIO(audio_bytes),
             beam_size=1,  # greedy = fastest
             language=language or None,
             initial_prompt=self._initial_prompt,
+            vad_filter=True,
         )
         text = " ".join(s.text.strip() for s in segments).strip()
         return text, info.language
