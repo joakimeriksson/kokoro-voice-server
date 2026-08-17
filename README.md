@@ -10,7 +10,7 @@ plus base Kokoro's other languages, with per-utterance language routing.
 
 Used by:
 - [reachy_mini_conversation_app](https://github.com/joakimeriksson/reachy_mini_conversation_app) — talks to it via `TTS_URL`/`STT_URL`
-- [mcp-agents](https://github.com/joakimeriksson/mcp-agents) — the face/speech demo clients
+- **CandyTron 4000** ([mcp-agents](https://github.com/joakimeriksson/mcp-agents)) — the candy-robot demo's face/speech clients
 
 Extracted from `reachy_mini_conversation_app` (history preserved) once a second
 project started using it. It was already its own uv project there: the
