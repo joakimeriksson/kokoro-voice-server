@@ -1,37 +1,34 @@
 """OpenAI-compatible voice server: Kokoro TTS + Whisper STT.
 
-Serves ``/v1/audio/speech`` (TTS) and ``/v1/audio/transcriptions`` (Whisper), so
-reachy_local_assistant stays thin — the models live here. Run it from its own
-environment (``cd voice-server && uv sync``); see voice-server/README.md.
+Serves ``/v1/audio/speech`` (TTS) and ``/v1/audio/transcriptions`` (Whisper) so
+client apps stay thin — the models live here. Run it from this repo's own
+environment (``uv sync``); see README.md.
 
 Pick the engine at launch:
 
     # Kokoro (English + its other supported languages, NOT Swedish)
-    python scripts/voice_server.py --engine kokoro --voice af_heart
+    uv run python voice_server.py --engine kokoro --voice af_heart
 
-    # Multilingual: the finished fine-tuned Swedish + base Kokoro languages, one
-    # model. Named Swedish voice packs (Stina, Björn, Nils, …) and the neural
-    # Swedish g2p; auto-routes on the caller's / STT-detected language. Pulls the
-    # weights + voices from HF (--voices-repo, default Joakim/kokoro-sv-voices);
-    # needs the swedish-kokoro repo on disk for its g2p module, plus:
-    #   pip install kokoro torch scipy misaki phonemizer-fork espeakng_loader
-    SWEDISH_KOKORO_PATH=../ai-smarthome/swedish-kokoro \
-      python scripts/voice_server.py --engine kokoro-svml --voice Stina
+    # Multilingual: the fine-tuned Swedish + base Kokoro languages, one model.
+    # Named Swedish voice packs (Stina, Björn, Nils, …) and the neural Swedish
+    # g2p (from the kokoro-sv package); auto-routes on the caller's /
+    # STT-detected language. Pulls the weights + voices from HF
+    # (--voices-repo, default Joakim/kokoro-sv-voices).
+    uv run python voice_server.py --engine kokoro-svml --voice Stina
 
-    # Swedish-only ONNX path (older single voice, espeak 'sv' g2p):
-    SWEDISH_KOKORO_PATH=../ai-smarthome/swedish-kokoro \
-      python scripts/voice_server.py --engine kokoro-sv
+    # Swedish-only ONNX path (older single voice, espeak 'sv' g2p); this one
+    # still needs a swedish-kokoro checkout on disk:
+    SWEDISH_KOKORO_PATH=../swedish-kokoro \
+      uv run python voice_server.py --engine kokoro-sv
 
-Add ``--whisper base`` (or tiny/small/medium) to enable transcription, which the
-app uses to store text rather than raw audio in the conversation history.
+Add ``--whisper base`` (or tiny/small/medium) to enable transcription, which
+clients can use to store text rather than raw audio in conversation history.
 
-Then point the app at it (in .env):
+Then point the client app at it:
 
     TTS_URL=http://<host>:8880/v1/audio/speech
     TTS_VOICE=<a voice name for the chosen engine, e.g. Stina for kokoro-svml>
     STT_URL=http://<host>:8880/v1/audio/transcriptions   # defaults to the TTS host
-
-Server tool only — lives outside ``src/`` so it never ships in the robot wheel.
 """
 
 import io
@@ -271,8 +268,9 @@ class KokoroSVMLEngine:
     language-blind (IPA -> audio), the SAME weights serve the other languages via
     a base ``KPipeline`` with a per-language default voice.
 
-    Needs (in this env): kokoro, torch, scipy, huggingface_hub, and the
-    swedish-kokoro repo on ``--svml-path`` (for its ``g2p_sv`` module).
+    Needs (in this env): kokoro, torch, scipy, huggingface_hub. The Swedish
+    ``g2p_sv`` module comes from the ``kokoro-sv`` package's vendored copy by
+    default; pass ``--svml-path`` to use a swedish-kokoro checkout instead.
     """
 
     # lang -> (KPipeline lang_code, default base voice). Swedish handled separately.
@@ -286,17 +284,28 @@ class KokoroSVMLEngine:
 
     def __init__(
         self,
-        svml_path: str,
+        svml_path: str | None,
         voices_repo: str,
         default_sv_voice: str = "Stina",
         lang: str = "sv",
         allowed_langs: str = "sv,en",
         device: str | None = None,
     ) -> None:
-        path = Path(svml_path).expanduser().resolve()
-        if not path.is_dir():
-            raise SystemExit(f"--svml-path not found: {path}")
-        sys.path.insert(0, str(path))  # for `import g2p_sv`
+        if svml_path:  # override: g2p_sv from a swedish-kokoro checkout
+            path = Path(svml_path).expanduser().resolve()
+            if not path.is_dir():
+                raise SystemExit(f"--svml-path not found: {path}")
+            sys.path.insert(0, str(path))  # for `import g2p_sv`
+        else:  # default: the kokoro-sv package's vendored g2p chain
+            try:
+                import kokoro_sv
+            except ImportError as exc:  # pragma: no cover
+                raise SystemExit(
+                    f"kokoro-sv package not installed and no --svml-path given: {exc}"
+                )
+            vend = Path(kokoro_sv.__file__).resolve().parent / "_vendor"
+            sys.path.insert(0, str(vend))
+            os.environ.setdefault("SV_G2P_DIR", str(vend / "g2p"))
         os.environ.setdefault("SV_NEURAL_G2P", "nst_g2p")  # prefer the neural Swedish g2p
         import torch
         from kokoro import KModel
@@ -305,7 +314,7 @@ class KokoroSVMLEngine:
         try:
             from g2p_sv import SwedishG2P
         except ImportError as exc:  # pragma: no cover
-            raise SystemExit(f"g2p_sv not importable from {path}: {exc}")
+            raise SystemExit(f"g2p_sv not importable: {exc}")
 
         if device is None:  # prefer GPU: cuda (3090) > mps (Apple Silicon) > cpu
             if torch.cuda.is_available():
@@ -594,8 +603,9 @@ def main() -> None:
     p.add_argument("--lang", default="a", help="Kokoro lang_code (a=US English, b=UK, ...)")
     p.add_argument(
         "--svml-path",
-        default=os.environ.get("SWEDISH_KOKORO_PATH", "../ai-smarthome/swedish-kokoro"),
-        help="path to the swedish-kokoro project (for --engine kokoro-sv / kokoro-svml g2p)",
+        default=os.environ.get("SWEDISH_KOKORO_PATH"),
+        help="path to a swedish-kokoro checkout; required for --engine kokoro-sv, "
+        "optional for kokoro-svml (default: the kokoro-sv package's vendored g2p)",
     )
     p.add_argument(
         "--voices-repo",
@@ -619,6 +629,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 
     if args.engine == "kokoro-sv":
+        if not args.svml_path:
+            raise SystemExit("--engine kokoro-sv needs --svml-path (or $SWEDISH_KOKORO_PATH)")
         engine: Any = SwedishKokoroEngine(args.svml_path)
     elif args.engine == "kokoro-svml":
         engine = KokoroSVMLEngine(

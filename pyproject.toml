@@ -1,11 +1,8 @@
 [project]
-name = "reachy-voice-server"
-version = "0.1.0"
-description = "Standalone OpenAI-compatible voice server (Kokoro engines) for reachy_local_assistant"
+name = "kokoro-voice-server"
+version = "0.2.0"
+description = "Standalone OpenAI-compatible voice server: Kokoro TTS (incl. fine-tuned Swedish voices) + Whisper STT"
 requires-python = ">=3.11,<3.13"
-# Its OWN environment so the Kokoro/transformers stack (needs huggingface-hub>=1.5)
-# doesn't collide with the app's pinned huggingface-hub==1.3.0. Runs the repo's
-# self-contained scripts/voice_server.py (kokoro / kokoro-sv / kokoro-svml engines).
 dependencies = [
     "fastapi",
     "uvicorn",
@@ -22,4 +19,14 @@ dependencies = [
     "lingua-language-detector",
     "faster-whisper",   # /v1/audio/transcriptions (Whisper STT, CPU int8)
     "python-multipart",  # FastAPI Form/File for the transcription endpoint
+    # Swedish neural g2p (vendored inside the kokoro-sv package) — makes the
+    # kokoro-svml engine work without a swedish-kokoro checkout on disk.
+    "kokoro-sv",
 ]
+
+[project.urls]
+Homepage = "https://github.com/joakimeriksson/kokoro-voice-server"
+Voices = "https://huggingface.co/Joakim/kokoro-sv-voices"
+
+[tool.uv.sources]
+kokoro-sv = { git = "https://github.com/joakimeriksson/swedish-kokoro" }
