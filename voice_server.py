@@ -174,10 +174,11 @@ class KokoroEngine:
         return self._default
 
     def synth(
-        self, text: str, voice: str | None, language: str | None = None, language_hint: str | None = None
+        self, text: str, voice: str | None, language: str | None = None,
+        language_hint: str | None = None, speed: float = 1.0
     ) -> Tuple[int, NDArray[np.int16]]:
         parts = []
-        for _gs, _ps, audio in self._pipeline(text, voice=self._resolve_voice(voice)):
+        for _gs, _ps, audio in self._pipeline(text, voice=self._resolve_voice(voice), speed=speed):
             arr = audio.detach().cpu().numpy() if hasattr(audio, "detach") else np.asarray(audio)
             parts.append(arr.astype(np.float32).reshape(-1))
         if not parts:
@@ -239,7 +240,8 @@ class SwedishKokoroEngine:
         return audio
 
     def synth(
-        self, text: str, voice: str | None, language: str | None = None, language_hint: str | None = None
+        self, text: str, voice: str | None, language: str | None = None,
+        language_hint: str | None = None, speed: float = 1.0
     ) -> Tuple[int, NDArray[np.int16]]:
         phonemes, _ = self._g2p(text)
         ipa = phonemes.replace("ʏ", "y")
@@ -248,7 +250,7 @@ class SwedishKokoroEngine:
             return 24000, np.zeros(0, dtype=np.int16)
         input_ids = np.array([[0, *ids, 0]], dtype=np.int64)
         ref_s = self._voice[len(ids) - 1]
-        audio, pred_dur = self._session.run(None, {"input_ids": input_ids, "ref_s": ref_s})
+        audio, pred_dur = self._session.run(None, {"input_ids": input_ids, "ref_s": ref_s, "speed": np.array([speed], dtype=np.float32)} if "speed" in {i.name for i in self._session.get_inputs()} else {"input_ids": input_ids, "ref_s": ref_s})
         audio = self._trim_eos_tail(np.asarray(audio).reshape(-1).astype(np.float32), pred_dur)
         pcm = np.clip(audio * 32767.0, -32768, 32767).astype(np.int16)
         return 24000, pcm
@@ -406,7 +408,7 @@ class KokoroSVMLEngine:
             out[-fade:] *= np.linspace(1.0, 0.0, fade).astype(out.dtype)
         return out
 
-    def _synth_sv(self, text: str, voice: str | None) -> NDArray[np.float32]:
+    def _synth_sv(self, text: str, voice: str | None, speed: float = 1.0) -> NDArray[np.float32]:
         # A base-Kokoro-style name (af_heart) isn't a Swedish pack -> use the default.
         name = voice if (voice and not _re.match(r"^[a-z][fm]_", voice)) else self._default_sv_voice
         try:
@@ -423,24 +425,25 @@ class KokoroSVMLEngine:
             audio_t, _pred_dur = self._model.forward_with_tokens(
                 torch.LongTensor([[0, *ids, 0]]).to(self._device),
                 vp[len(ids) - 1].to(self._device),
-                speed=1.0,
+                speed=speed,
             )
         audio = self._notch(audio_t.squeeze().cpu().numpy().astype(np.float32))
         return self._trim_silence(audio)
 
-    def _synth_other(self, text: str, lang: str, voice: str | None) -> NDArray[np.float32]:
+    def _synth_other(self, text: str, lang: str, voice: str | None, speed: float = 1.0) -> NDArray[np.float32]:
         code, default_voice = self._LANGS.get(lang, self._LANGS["en"])
         # Only forward a real base-Kokoro voice (af_heart); ignore Swedish/Piper/OpenAI
         # names so each language uses its own default voice.
         kvoice = voice if (voice and _re.match(r"^[a-z][fm]_", voice)) else default_voice
         chunks = [
             a.detach().cpu().numpy() if hasattr(a, "detach") else np.asarray(a)
-            for _gs, _ps, a in self._pipe(code)(text, voice=kvoice)
+            for _gs, _ps, a in self._pipe(code)(text, voice=kvoice, speed=speed)
         ]
         return np.concatenate(chunks).astype(np.float32) if chunks else np.zeros(0, dtype=np.float32)
 
     def synth(
-        self, text: str, voice: str | None, language: str | None = None, language_hint: str | None = None
+        self, text: str, voice: str | None, language: str | None = None,
+        language_hint: str | None = None, speed: float = 1.0
     ) -> Tuple[int, NDArray[np.int16]]:
         hint = _norm_lang(language_hint)
         hint = hint if hint in self._allowed else ""
@@ -468,9 +471,9 @@ class KokoroSVMLEngine:
         if lang not in self._allowed:
             lang = hint or self._primary
         if lang in ("sv", "swedish", "se"):
-            audio = self._synth_sv(text, voice)
+            audio = self._synth_sv(text, voice, speed)
         else:
-            audio = self._synth_other(text, lang, voice)
+            audio = self._synth_other(text, lang, voice, speed)
         pcm = np.clip(audio.reshape(-1) * 32767.0, -32768, 32767).astype(np.int16)
         return 24000, pcm
 
@@ -538,6 +541,8 @@ def build_app(engine: Any, stt: Any = None) -> Any:
         # `language`, nor a confident detection (so switching language mid-chat
         # still works as soon as the user says a full sentence in it).
         language_hint: str | None = None
+        # Speech rate multiplier: 1.0 = normal, <1 slower, >1 faster (clamped 0.5-2.0).
+        speed: float = 1.0
         model: str = ""
         response_format: str = "wav"
 
@@ -580,7 +585,9 @@ def build_app(engine: Any, stt: Any = None) -> Any:
         sample_rate = 24000
         parts = []
         for chunk in split_sentences(text) or [text]:
-            sample_rate, pcm = engine.synth(chunk, body.voice, body.language, body.language_hint)
+            sample_rate, pcm = engine.synth(chunk, body.voice, body.language,
+                                            body.language_hint,
+                                            max(0.5, min(2.0, body.speed or 1.0)))
             if len(pcm):
                 parts.append(pcm)
         pcm = np.concatenate(parts) if parts else np.zeros(0, dtype=np.int16)
