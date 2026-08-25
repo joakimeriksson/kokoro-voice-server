@@ -541,7 +541,18 @@ def build_app(engine: Any, stt: Any = None) -> Any:
         model: str = ""
         response_format: str = "wav"
 
-    app = FastAPI(title="reachy_local_assistant voice server")
+    app = FastAPI(title="kokoro voice server")
+
+    @app.on_event("startup")
+    async def _single_inference_thread() -> None:
+        # The sync endpoints below run on Starlette's worker threadpool (up to
+        # 40 threads). macOS/glibc malloc keeps per-thread free-lists, so every
+        # worker that has ever run torch inference retains its own few hundred
+        # MB of cached allocations: measured 8 days of service = 17 GB RSS,
+        # ~+25 MB per request until all workers had been used. One worker
+        # thread = one cache (and the engines are not thread-safe anyway).
+        import anyio
+        anyio.to_thread.current_default_thread_limiter().total_tokens = 1
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -621,6 +632,11 @@ def main() -> None:
         "(fr -> ff_siwis), not the Swedish pack — only 'sv' uses the fine-tuned voices",
     )
     p.add_argument(
+        "--device",
+        default=os.environ.get("KOKORO_DEVICE"),
+        help="torch device for the Kokoro engines: cpu, mps or cuda (default: auto — cuda > mps > cpu)",
+    )
+    p.add_argument(
         "--whisper",
         default=os.environ.get("WHISPER_MODEL", "off"),
         help="faster-whisper size for /v1/audio/transcriptions (tiny/base/small/medium), or 'off'",
@@ -639,6 +655,7 @@ def main() -> None:
             default_sv_voice=args.voice or "Stina",
             lang="auto" if args.lang == "a" else args.lang,
             allowed_langs=args.langs,
+            device=args.device,
         )
     else:
         engine = KokoroEngine(args.voice or "af_heart", args.lang)
