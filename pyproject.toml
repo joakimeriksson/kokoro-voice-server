@@ -22,6 +22,10 @@ dependencies = [
     # Swedish neural g2p (vendored inside the kokoro-sv package) — makes the
     # kokoro-svml engine work without a swedish-kokoro checkout on disk.
     "kokoro-sv",
+    # spaCy model misaki's English g2p loads (it would otherwise try to pip-download
+    # it at runtime, which fails inside a uv-managed venv). Declared here so
+    # `uv sync` installs it and never removes it as "unmanaged".
+    "en-core-web-sm",
 ]
 
 [project.urls]
@@ -30,3 +34,4 @@ Voices = "https://huggingface.co/Joakim/kokoro-sv-voices"
 
 [tool.uv.sources]
 kokoro-sv = { git = "https://github.com/joakimeriksson/swedish-kokoro" }
+en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }
