@@ -676,7 +676,27 @@ def main() -> None:
 
     import uvicorn
 
-    uvicorn.run(build_app(engine, stt), host=args.host, port=args.port)
+    app = build_app(engine, stt)
+    if args.host in ("::", "dual"):
+        # Serve BOTH stacks from one socket. uvicorn's own "::" bind is v6-only
+        # here, and that breaks clients that resolve this host to IPv4 — a robot
+        # reaching us by mDNS name may pick either family, so refusing one makes
+        # the voice server look "unreachable" while other services on the same
+        # machine answer fine.
+        import socket
+
+        if not socket.has_dualstack_ipv6():
+            logger.warning("Dual-stack sockets unsupported here; falling back to IPv4 0.0.0.0")
+            uvicorn.run(app, host="0.0.0.0", port=args.port)
+            return
+        sock = socket.create_server(
+            ("::", args.port), family=socket.AF_INET6, dualstack_ipv6=True, reuse_port=False
+        )
+        logger.info("Listening dual-stack (IPv4 + IPv6) on port %d", args.port)
+        uvicorn.Server(uvicorn.Config(app)).run(sockets=[sock])
+        return
+
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
