@@ -408,29 +408,6 @@ class KokoroSVMLEngine:
             out[-fade:] *= np.linspace(1.0, 0.0, fade).astype(out.dtype)
         return out
 
-    @staticmethod
-    def _normalize_sv_numbers(text: str) -> str:
-        """Spell digits out in Swedish before g2p, which drops them outright.
-
-        Measured (Sep 2026, Greta): "A1, A2, B1" came out as "bæbe, se" with
-        every digit missing; "A ett, A två, B ett" was spoken correctly. Grid
-        positions like A2/O0 are the demo's whole vocabulary, so this matters.
-        Letter+digit combos get a space so the letter is still said.
-        """
-        from num2words import num2words
-
-        def digits_to_words(m: "_re.Match[str]") -> str:
-            token = m.group(0)
-            if "," in token or "." in token:           # 1,3 / 1.3 -> ett komma tre
-                whole, _sep, frac = _re.split(r"([,.])", token, maxsplit=1)
-                return (f"{num2words(int(whole), lang='sv')} komma "
-                        + " ".join(num2words(int(d), lang='sv') for d in frac))
-            return num2words(int(token), lang="sv")
-
-        text = _re.sub(r"(?<=[A-Za-zÅÄÖåäö])(?=\d)", " ", text)   # A1 -> A 1
-        text = _re.sub(r"(?<=\d)(?=[A-Za-zÅÄÖåäö])", " ", text)   # 1A -> 1 A
-        return _re.sub(r"\d+(?:[,.]\d+)?", digits_to_words, text)
-
     def _synth_sv(self, text: str, voice: str | None, speed: float = 1.0) -> NDArray[np.float32]:
         # A base-Kokoro-style name (af_heart) isn't a Swedish pack -> use the default.
         name = voice if (voice and not _re.match(r"^[a-z][fm]_", voice)) else self._default_sv_voice
@@ -439,7 +416,7 @@ class KokoroSVMLEngine:
         except Exception:
             logger.warning("swedish voice %r not found in %s; using %s", name, self._voices_repo, self._default_sv_voice)
             vp = self._sv_voicepack(self._default_sv_voice)
-        text = self._normalize_sv_numbers(text)
+        # Digits are spelled out inside kokoro-sv's SwedishG2P (>= 0.1.2).
         ipa = self._g2p(text).replace("ʏ", "y")
         ids = [i for i in (self._model.vocab.get(p) for p in ipa) if i is not None]
         if not ids:

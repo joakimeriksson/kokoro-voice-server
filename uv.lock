@@ -681,11 +681,12 @@ wheels = [
 
 [[package]]
 name = "kokoro-sv"
-version = "0.1.1"
-source = { git = "https://github.com/joakimeriksson/swedish-kokoro#7e4e7bd3bd0d0b94f5b7634fbc902d46677d14cc" }
+version = "0.1.2"
+source = { git = "https://github.com/joakimeriksson/kokoro-sv#42d1a3a5c083f405a6eb8e14c2a405ccb36cc90f" }
 dependencies = [
     { name = "huggingface-hub" },
     { name = "kokoro" },
+    { name = "num2words" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -729,7 +730,7 @@ requires-dist = [
     { name = "faster-whisper" },
     { name = "huggingface-hub", specifier = ">=1.5" },
     { name = "kokoro" },
-    { name = "kokoro-sv", git = "https://github.com/joakimeriksson/swedish-kokoro" },
+    { name = "kokoro-sv", git = "https://github.com/joakimeriksson/kokoro-sv" },
     { name = "lingua-language-detector" },
     { name = "misaki" },
     { name = "numpy" },
