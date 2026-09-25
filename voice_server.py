@@ -153,6 +153,10 @@ class KokoroEngine:
         self._pipeline = KPipeline(lang_code=lang_code)
         self._default = default_voice
         self.default_voice = default_voice  # reported by /health
+        self.kmodel = self._pipeline.model  # for warm_shapes()
+        self.device = str(next(self.kmodel.parameters()).device) if self.kmodel is not None else "cpu"
+        if self.device.startswith("mps"):
+            install_hybrid_forward(self.kmodel, self.device)
 
     def _resolve_voice(self, voice: str | None) -> str:
         """Return a usable base-Kokoro voice, falling back to the default.
@@ -341,6 +345,10 @@ class KokoroSVMLEngine:
         cfg = hf_hub_download(voices_repo, "config.json")
         wts = hf_hub_download(voices_repo, "kokoro_sv.pth")
         self._model = KModel(repo_id="hexgrad/Kokoro-82M", config=cfg, model=wts).to(device).eval()
+        self.kmodel = self._model  # for warm_shapes()
+        self.device = device
+        if device.startswith("mps"):
+            install_hybrid_forward(self._model, device)
         self._g2p = SwedishG2P(backend="neural")
         self._sv_voices: dict[str, Any] = {}  # name -> voicepack tensor (lazy, cached)
         self._pipes: dict[str, Any] = {}  # KPipeline lang_code -> pipeline (lazy, cached)
@@ -479,6 +487,99 @@ class KokoroSVMLEngine:
         return 24000, pcm
 
 
+# --- Apple MPS: split the model, warm the decoder ---------------------------
+#
+# On MPS every NEW tensor shape costs a graph compile: measured on an M5 Max,
+# a never-seen sentence length took 0.65-0.85 s to synthesize vs 0.07 s once
+# that shape was cached (0.16 s if macOS's on-disk shader cache had it from an
+# earlier process). A conversation is made of novel sentences, so nearly every
+# reply paid it — that was the "sporadic 0.4-0.8 s TTS spike" in the app's
+# latency budget. Two shapes vary per utterance: the token length L (BERT, text
+# encoder, duration LSTM) and the frame count F (F0/N LSTMs, decoder).
+#
+# The LSTM-heavy front is cheap on CPU (~30 ms total, no shape cost) and the
+# LSTM compiles on MPS grow with length; the decoder (iSTFTNet convs) is the one
+# part that is slow on CPU (~0.35 s) and fast on MPS (~45 ms). So on MPS the
+# model is split: front on CPU, decoder on MPS. Only F then needs warming —
+# one small decoder forward per frame count, ~0.3 s each the first time ever,
+# ~0.05 s from the OS cache — done in the background at startup. Result:
+# novel sentences synthesize in ~0.1-0.2 s flat instead of 0.4-0.8 s.
+# Kokoro: 24 kHz, 600 samples per frame → 40 frames per second of speech.
+WARM_FRAMES_PER_SECOND = 40
+
+
+def install_hybrid_forward(model: Any, gpu: str) -> None:
+    """Move Kokoro's text front to CPU and keep only the decoder on *gpu*.
+
+    Replaces ``model.forward_with_tokens`` on the instance with the same
+    computation split across devices, so both ``KModel.forward`` (base
+    Kokoro's pipeline) and direct ``forward_with_tokens`` callers (the Swedish
+    engine) pick it up unchanged.
+    """
+    import torch
+
+    for sub in (model.bert, model.bert_encoder, model.predictor, model.text_encoder):
+        sub.to("cpu")
+    model.decoder.to(gpu)
+
+    @torch.no_grad()
+    def forward_with_tokens(input_ids: Any, ref_s: Any, speed: float = 1) -> Tuple[Any, Any]:
+        input_ids = input_ids.cpu()
+        ref_s = ref_s.cpu()
+        L = input_ids.shape[-1]
+        input_lengths = torch.full((input_ids.shape[0],), L, dtype=torch.long)
+        text_mask = torch.arange(L).unsqueeze(0).expand(input_lengths.shape[0], -1).type_as(input_lengths)
+        text_mask = torch.gt(text_mask + 1, input_lengths.unsqueeze(1))
+        bert_dur = model.bert(input_ids, attention_mask=(~text_mask).int())
+        d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
+        s = ref_s[:, 128:]
+        d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
+        x, _ = model.predictor.lstm(d)
+        duration = model.predictor.duration_proj(x)
+        duration = torch.sigmoid(duration).sum(axis=-1) / speed
+        pred_dur = torch.round(duration).clamp(min=1).long().squeeze()
+        indices = torch.repeat_interleave(torch.arange(L), pred_dur)
+        pred_aln_trg = torch.zeros((L, indices.shape[0]))
+        pred_aln_trg[indices, torch.arange(indices.shape[0])] = 1
+        pred_aln_trg = pred_aln_trg.unsqueeze(0)
+        en = d.transpose(-1, -2) @ pred_aln_trg
+        F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
+        t_en = model.text_encoder(input_ids, input_lengths, text_mask)
+        asr = t_en @ pred_aln_trg
+        audio = model.decoder(asr.to(gpu), F0_pred.to(gpu), N_pred.to(gpu), ref_s[:, :128].to(gpu)).squeeze()
+        return audio, pred_dur
+
+    model.forward_with_tokens = forward_with_tokens
+    logger.info("Kokoro split: text front on cpu, decoder on %s (MPS shape-compile workaround)", gpu)
+
+
+def warm_shape_steps(model: Any, device: str, max_seconds: float = 12.0):
+    """Yield zero-arg callables, one per decoder frame count to warm on *device*.
+
+    They are yielded rather than run so the caller can interleave them with
+    real requests on the inference thread: a request never waits behind more
+    than one step (< 0.5 s).
+    """
+    import torch
+
+    spk = torch.zeros(1, 128, device=device)
+
+    def frame_step(F: int):
+        def run() -> None:
+            with torch.no_grad():
+                model.decoder(
+                    torch.zeros(1, 512, F, device=device),
+                    torch.zeros(1, 2 * F, device=device),
+                    torch.zeros(1, 2 * F, device=device),
+                    spk,
+                )
+        return run
+
+    # Short replies (few frames) first so the common case warms earliest.
+    for F in range(8, int(max_seconds * WARM_FRAMES_PER_SECOND) + 1):
+        yield frame_step(F)
+
+
 def _to_audio_bytes(sample_rate: int, pcm: NDArray[np.int16], fmt: str) -> Tuple[bytes, str]:
     import soundfile as sf
 
@@ -525,10 +626,26 @@ class WhisperSTT:
         return text, info.language
 
 
-def build_app(engine: Any, stt: Any = None) -> Any:
+def build_app(engine: Any, stt: Any = None, warm_shapes: bool = True, warm_seconds: float = 12.0) -> Any:
+    import time
+    import asyncio
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
     from fastapi import File, Form, FastAPI, Response, UploadFile
     from pydantic import BaseModel
     from fastapi.responses import JSONResponse
+
+    # ONE dedicated thread per engine, for the life of the process. Starlette's
+    # default threadpool (up to 40 workers) is unusable for torch inference:
+    # macOS/glibc malloc keeps per-thread free-lists, so every worker that has
+    # ever run inference retains a few hundred MB of cached allocations
+    # (measured: 8 days of service = 17 GB RSS). A fixed thread per engine caps
+    # that at two caches, and keeps each (non-thread-safe) engine serialised —
+    # while letting TTS and Whisper overlap, which the conversation app relies
+    # on: it transcribes the user's turn WHILE the reply is being spoken/prepared.
+    tts_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts")
+    stt_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stt")
 
     class SpeechRequest(BaseModel):
         """OpenAI /v1/audio/speech request body (extra fields ignored)."""
@@ -549,16 +666,46 @@ def build_app(engine: Any, stt: Any = None) -> Any:
 
     app = FastAPI(title="kokoro voice server")
 
+    warm_state = {"done": 0, "total": 0, "finished": not warm_shapes}
+
+    def _warm_in_background() -> None:
+        """Run warm_shape_steps on the TTS thread, one step at a time.
+
+        Steps are submitted individually so real requests queue between them:
+        a request during warm-up waits for at most one step (< 1 s), and the
+        server is usable from the first second — just not yet at full speed.
+        """
+        model = getattr(engine, "kmodel", None)
+        device = str(getattr(engine, "device", "cpu"))
+        if model is None or not device.startswith("mps"):
+            warm_state["finished"] = True
+            return  # only MPS pays per-shape compiles; CPU/CUDA need no warming
+        steps = list(warm_shape_steps(model, device, max_seconds=warm_seconds))
+        warm_state["total"] = len(steps)
+        t0 = time.perf_counter()
+        logger.info("Warming %d MPS shapes in the background (TTS answers meanwhile)...", len(steps))
+        for i, step in enumerate(steps, 1):
+            try:
+                tts_pool.submit(step).result()
+            except Exception as exc:  # a warm step must never take the server down
+                logger.warning("shape warm-up step %d failed: %s", i, exc)
+                break
+            warm_state["done"] = i
+        # One real utterance per language: the steps above cover the shape-
+        # sensitive sub-modules, this covers the rest of the graph (and builds
+        # the lazily-created base-Kokoro pipeline for the non-Swedish languages).
+        for lang, text in (("sv", "Hej, nu är jag varm."), ("en", "Hello, I am warmed up now.")):
+            try:
+                tts_pool.submit(engine.synth, text, None, lang).result()
+            except Exception as exc:
+                logger.debug("warm-up utterance (%s) failed: %s", lang, exc)
+        warm_state["finished"] = True
+        logger.info("MPS shape warm-up done: %d shapes in %.0f s", warm_state["done"], time.perf_counter() - t0)
+
     @app.on_event("startup")
-    async def _single_inference_thread() -> None:
-        # The sync endpoints below run on Starlette's worker threadpool (up to
-        # 40 threads). macOS/glibc malloc keeps per-thread free-lists, so every
-        # worker that has ever run torch inference retains its own few hundred
-        # MB of cached allocations: measured 8 days of service = 17 GB RSS,
-        # ~+25 MB per request until all workers had been used. One worker
-        # thread = one cache (and the engines are not thread-safe anyway).
-        import anyio
-        anyio.to_thread.current_default_thread_limiter().total_tokens = 1
+    async def _start_warmup() -> None:
+        if warm_shapes:
+            threading.Thread(target=_warm_in_background, name="warm-shapes", daemon=True).start()
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -574,13 +721,13 @@ def build_app(engine: Any, stt: Any = None) -> Any:
             "default_voice": getattr(engine, "default_voice", "") or "",
             "tts": True,
             "stt": stt is not None,
+            # False while MPS shapes are still being warmed: TTS works but a
+            # novel sentence may take ~0.7 s instead of ~0.1 s.
+            "warm": warm_state["finished"],
+            "warm_progress": f"{warm_state['done']}/{warm_state['total']}",
         }
 
-    @app.post("/v1/audio/speech")
-    def speech(body: SpeechRequest) -> Response:
-        text = (body.input or "").strip()
-        if not text:
-            return Response(content=b"", media_type="audio/wav")
+    def _synth_all(body: SpeechRequest, text: str) -> Tuple[int, NDArray[np.int16]]:
         # Chunk long text by sentence: Kokoro caps at ~510 tokens/utterance, and it
         # keeps any single engine call small. Concatenate the PCM back into one WAV.
         sample_rate = 24000
@@ -591,8 +738,23 @@ def build_app(engine: Any, stt: Any = None) -> Any:
                                             max(0.5, min(2.0, body.speed or 1.0)))
             if len(pcm):
                 parts.append(pcm)
-        pcm = np.concatenate(parts) if parts else np.zeros(0, dtype=np.int16)
+        return sample_rate, (np.concatenate(parts) if parts else np.zeros(0, dtype=np.int16))
+
+    @app.post("/v1/audio/speech")
+    async def speech(body: SpeechRequest) -> Response:
+        text = (body.input or "").strip()
+        if not text:
+            return Response(content=b"", media_type="audio/wav")
+        t0 = time.perf_counter()
+        loop = asyncio.get_running_loop()
+        sample_rate, pcm = await loop.run_in_executor(tts_pool, _synth_all, body, text)
         audio, media = _to_audio_bytes(sample_rate, pcm, body.response_format)
+        # Per-request timing: the conversation app's latency budget is built from these.
+        logger.info(
+            "TTS %4.0f ms -> %4.1f s audio  lang=%s hint=%s  %r",
+            (time.perf_counter() - t0) * 1000, len(pcm) / sample_rate,
+            body.language or "-", body.language_hint or "-", text[:60],
+        )
         return Response(content=audio, media_type=media)
 
     @app.post("/v1/audio/transcriptions")
@@ -607,7 +769,12 @@ def build_app(engine: Any, stt: Any = None) -> Any:
         data = await file.read()
         if not data:
             return {"text": "", "language": language or ""}
-        text, lang = stt.transcribe(data, language=language)
+        t0 = time.perf_counter()
+        loop = asyncio.get_running_loop()
+        text, lang = await loop.run_in_executor(stt_pool, stt.transcribe, data, language)
+        logger.info(
+            "STT %4.0f ms  lang=%s  %r", (time.perf_counter() - t0) * 1000, lang or "-", text[:60]
+        )
         return {"text": text, "language": lang}
 
     return app
@@ -645,6 +812,15 @@ def main() -> None:
         help="torch device for the Kokoro engines: cpu, mps or cuda (default: auto — cuda > mps > cpu)",
     )
     p.add_argument(
+        "--no-warm-shapes", action="store_true",
+        help="skip the background MPS shape warm-up (see warm_shape_steps); "
+        "TTS then costs ~0.7 s per never-seen sentence length instead of ~0.1 s",
+    )
+    p.add_argument(
+        "--warm-seconds", type=float, default=12.0,
+        help="warm frame counts for utterances up to this many seconds of audio (default 12)",
+    )
+    p.add_argument(
         "--whisper",
         default=os.environ.get("WHISPER_MODEL", "off"),
         help="faster-whisper size for /v1/audio/transcriptions (tiny/base/small/medium), or 'off'",
@@ -677,7 +853,7 @@ def main() -> None:
 
     import uvicorn
 
-    app = build_app(engine, stt)
+    app = build_app(engine, stt, warm_shapes=not args.no_warm_shapes, warm_seconds=args.warm_seconds)
     if args.host in ("::", "dual"):
         # Serve BOTH stacks from one socket. uvicorn's own "::" bind is v6-only
         # here, and that breaks clients that resolve this host to IPv4 — a robot
