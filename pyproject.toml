@@ -26,6 +26,7 @@ dependencies = [
     # it at runtime, which fails inside a uv-managed venv). Declared here so
     # `uv sync` installs it and never removes it as "unmanaged".
     "en-core-web-sm",
+    "speechbrain>=1.1.1",
 ]
 
 [project.urls]

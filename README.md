@@ -100,6 +100,29 @@ To keep a robot strictly Swedish + English, start with `--langs sv,en`.
 > `kokoro-svml` defaults to the neural g2p and only checks that the *adapter*
 > imports, not the model — the startup log must say `swedish g2p backend=neural`.
 
+## Speaker verification (`/v1/audio/speaker`)
+
+Start with `--speaker ecapa` and the server also returns a **speaker embedding**
+for an utterance: an ECAPA-TDNN 192-d unit vector, the audio twin of a face
+embedding. Cosine similarity between two vectors tells whether the same person
+spoke. A client can use it to tell a bystander's sentence from the focused
+visitor's, to keep a conversation attached to a person whose face turned away,
+or to recognize a returning voice.
+
+```bash
+curl -s localhost:8880/v1/audio/speaker -F file=@utterance.wav
+# {"embedding": [0.03, ...], "dim": 192, "seconds": 2.4, "model": "speechbrain/spkrec-ecapa-voxceleb"}
+```
+
+Privacy, by construction: the server keeps **no** identities and **no** audio.
+It turns a clip into a vector and forgets it; any database of voices belongs to
+the client, on its own disk. Runs on CPU, ~20 ms per 3 s clip. The model
+(~80 MB) is fetched once from the HuggingFace hub into
+`~/.cache/speechbrain/` (override with `SPEAKER_MODEL_DIR`); set
+`HF_HUB_OFFLINE=1` afterwards for a guaranteed no-network run. `/health`
+reports `"speaker": true` when enabled. Clips shorter than 0.25 s return an
+empty embedding; clips under ~2 s give noticeably less reliable matches.
+
 ## Verify
 
 ```bash

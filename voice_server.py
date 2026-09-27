@@ -626,7 +626,57 @@ class WhisperSTT:
         return text, info.language
 
 
-def build_app(engine: Any, stt: Any = None, warm_shapes: bool = True, warm_seconds: float = 12.0) -> Any:
+class SpeakerEncoder:
+    """Speaker-verification embeddings (ECAPA-TDNN) for /v1/audio/speaker.
+
+    Returns one 192-d unit vector per utterance; cosine similarity between two
+    vectors says whether the same person spoke. This is the audio twin of the
+    face embedder: the SERVER holds no identities and no audio -- it turns a
+    clip into a vector and forgets it. Whatever database of voices exists lives
+    in the client, on its own disk.
+
+    Runs on CPU (about 20 ms for a 3 s clip), so it never contends with the
+    TTS decoder on the GPU. The model (~80 MB) is fetched once from the
+    HuggingFace hub into the local cache; set HF_HUB_OFFLINE=1 afterwards to
+    guarantee no network access at all.
+    """
+
+    MODEL = "speechbrain/spkrec-ecapa-voxceleb"
+    SAMPLE_RATE = 16000
+
+    def __init__(self) -> None:
+        import torch
+        from speechbrain.inference.speaker import EncoderClassifier
+
+        cache = Path(os.environ.get("SPEAKER_MODEL_DIR",
+                                    Path.home() / ".cache" / "speechbrain" / "spkrec-ecapa-voxceleb"))
+        self._torch = torch
+        self._enc = EncoderClassifier.from_hparams(
+            source=self.MODEL, savedir=str(cache), run_opts={"device": "cpu"})
+        self._enc.encode_batch(torch.zeros(1, self.SAMPLE_RATE))  # warm the graph
+        logger.info("Speaker encoder ready: %s (cpu, 192-d)", self.MODEL)
+
+    def embed(self, audio_bytes: bytes) -> Tuple[list, float]:
+        """Return (unit-norm embedding as a list, clip length in seconds)."""
+        import soundfile as sf
+
+        audio, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=True)
+        mono = audio.mean(axis=1)
+        if sr != self.SAMPLE_RATE:
+            n = int(len(mono) * self.SAMPLE_RATE / sr)
+            mono = np.interp(np.linspace(0, len(mono) - 1, n), np.arange(len(mono)), mono).astype(np.float32)
+        seconds = len(mono) / self.SAMPLE_RATE
+        if len(mono) < self.SAMPLE_RATE // 4:   # < 0.25 s: nothing to fingerprint
+            return [], seconds
+        with self._torch.no_grad():
+            emb = self._enc.encode_batch(self._torch.from_numpy(mono)[None, :])
+        vec = emb.squeeze().cpu().numpy().astype(np.float32)
+        norm = float(np.linalg.norm(vec)) or 1.0
+        return (vec / norm).tolist(), seconds
+
+
+def build_app(engine: Any, stt: Any = None, warm_shapes: bool = True, warm_seconds: float = 12.0,
+              speaker: Any = None) -> Any:
     import time
     import asyncio
     import threading
@@ -646,6 +696,7 @@ def build_app(engine: Any, stt: Any = None, warm_shapes: bool = True, warm_secon
     # on: it transcribes the user's turn WHILE the reply is being spoken/prepared.
     tts_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts")
     stt_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stt")
+    spk_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="speaker")
 
     class SpeechRequest(BaseModel):
         """OpenAI /v1/audio/speech request body (extra fields ignored)."""
@@ -721,6 +772,7 @@ def build_app(engine: Any, stt: Any = None, warm_shapes: bool = True, warm_secon
             "default_voice": getattr(engine, "default_voice", "") or "",
             "tts": True,
             "stt": stt is not None,
+            "speaker": speaker is not None,
             # False while MPS shapes are still being warmed: TTS works but a
             # novel sentence may take ~0.7 s instead of ~0.1 s.
             "warm": warm_state["finished"],
@@ -777,6 +829,27 @@ def build_app(engine: Any, stt: Any = None, warm_shapes: bool = True, warm_secon
         )
         return {"text": text, "language": lang}
 
+    @app.post("/v1/audio/speaker")
+    async def speaker_embedding(file: UploadFile = File(...)) -> Any:
+        """Speaker-verification embedding for one utterance.
+
+        multipart ``file`` (wav/flac/ogg) -> ``{"embedding": [192 floats],
+        "dim": 192, "seconds": clip length, "model": name}``. Compare two
+        embeddings by cosine similarity (dot product; they are unit vectors).
+        Clips under 0.25 s return an empty embedding. Nothing is stored.
+        """
+        if speaker is None:
+            return JSONResponse({"error": "speaker embeddings not enabled (start with --speaker ecapa)"},
+                                status_code=501)
+        data = await file.read()
+        if not data:
+            return {"embedding": [], "dim": 0, "seconds": 0.0, "model": speaker.MODEL}
+        t0 = time.perf_counter()
+        loop = asyncio.get_running_loop()
+        vec, seconds = await loop.run_in_executor(spk_pool, speaker.embed, data)
+        logger.info("SPEAKER %4.0f ms  clip=%.1fs", (time.perf_counter() - t0) * 1000, seconds)
+        return {"embedding": vec, "dim": len(vec), "seconds": round(seconds, 2), "model": speaker.MODEL}
+
     return app
 
 
@@ -821,6 +894,11 @@ def main() -> None:
         help="warm frame counts for utterances up to this many seconds of audio (default 12)",
     )
     p.add_argument(
+        "--speaker",
+        default=os.environ.get("SPEAKER_MODEL", "off"),
+        help="speaker-verification embeddings on /v1/audio/speaker: 'ecapa' or 'off' (default off)",
+    )
+    p.add_argument(
         "--whisper",
         default=os.environ.get("WHISPER_MODEL", "off"),
         help="faster-whisper size for /v1/audio/transcriptions (tiny/base/small/medium), or 'off'",
@@ -847,13 +925,17 @@ def main() -> None:
     stt = None
     if args.whisper and args.whisper.lower() != "off":
         stt = WhisperSTT(args.whisper)
+    speaker = None
+    if args.speaker and args.speaker.lower() != "off":
+        speaker = SpeakerEncoder()
     logger.info(
         "Voice server: engine=%s whisper=%s on %s:%d", args.engine, args.whisper, args.host, args.port
     )
 
     import uvicorn
 
-    app = build_app(engine, stt, warm_shapes=not args.no_warm_shapes, warm_seconds=args.warm_seconds)
+    app = build_app(engine, stt, warm_shapes=not args.no_warm_shapes, warm_seconds=args.warm_seconds,
+                    speaker=speaker)
     if args.host in ("::", "dual"):
         # Serve BOTH stacks from one socket. uvicorn's own "::" bind is v6-only
         # here, and that breaks clients that resolve this host to IPv4 — a robot
