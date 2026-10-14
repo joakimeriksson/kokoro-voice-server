@@ -296,7 +296,10 @@ class KokoroSVMLEngine:
         lang: str = "sv",
         allowed_langs: str = "sv,en",
         device: str | None = None,
+        other_langs_weights: str = "base",
     ) -> None:
+        if other_langs_weights not in ("base", "swedish"):
+            raise SystemExit(f"other_langs_weights must be 'base' or 'swedish', not {other_langs_weights!r}")
         if svml_path:  # override: g2p_sv from a swedish-kokoro checkout
             path = Path(svml_path).expanduser().resolve()
             if not path.is_dir():
@@ -349,13 +352,29 @@ class KokoroSVMLEngine:
         self.device = device
         if device.startswith("mps"):
             install_hybrid_forward(self._model, device)
+        # Non-Swedish languages: the ORIGINAL Kokoro-82M weights by default.
+        # The Swedish fine-tune shares one network, and training it on Swedish
+        # only measurably degraded the others (vs base, same voices, Whisper
+        # small: fr CER 0.007 -> 0.121; heard-as-language es 0.98 -> 0.80,
+        # it 0.95 -> 0.66; en unchanged). A second 82M model (~330 MB) makes
+        # en/fr/es/it exactly base Kokoro, whatever later Swedish training does.
+        self.other_langs_weights = other_langs_weights
+        if other_langs_weights == "base":
+            self._other_model = KModel(repo_id="hexgrad/Kokoro-82M").to(device).eval()
+            if device.startswith("mps"):
+                install_hybrid_forward(self._other_model, device)
+        else:
+            self._other_model = self._model
+        self.kmodels = [self._model] + ([self._other_model] if self._other_model is not self._model else [])
         self._g2p = SwedishG2P(backend="neural")
         self._sv_voices: dict[str, Any] = {}  # name -> voicepack tensor (lazy, cached)
         self._pipes: dict[str, Any] = {}  # KPipeline lang_code -> pipeline (lazy, cached)
         backend = getattr(self._g2p, "backend", "?")
         logger.info(
-            "KokoroSVML ready: device=%s, swedish g2p=%s, voices=%s, default sv voice=%s, langs=%s (primary %s)",
+            "KokoroSVML ready: device=%s, swedish g2p=%s, voices=%s, default sv voice=%s, langs=%s (primary %s), "
+            "other languages on %s weights",
             device, backend, voices_repo, default_sv_voice, sorted(self._allowed), self._primary,
+            other_langs_weights,
         )
 
     def _sv_voicepack(self, name: str) -> Any:
@@ -372,7 +391,7 @@ class KokoroSVMLEngine:
         if code not in self._pipes:
             from kokoro import KPipeline
 
-            self._pipes[code] = KPipeline(lang_code=code, repo_id="hexgrad/Kokoro-82M", model=self._model)
+            self._pipes[code] = KPipeline(lang_code=code, repo_id="hexgrad/Kokoro-82M", model=self._other_model)
         return self._pipes[code]
 
     def _notch(self, audio: NDArray[np.float32]) -> NDArray[np.float32]:
@@ -726,12 +745,14 @@ def build_app(engine: Any, stt: Any = None, warm_shapes: bool = True, warm_secon
         a request during warm-up waits for at most one step (< 1 s), and the
         server is usable from the first second — just not yet at full speed.
         """
-        model = getattr(engine, "kmodel", None)
+        models = getattr(engine, "kmodels", None) or [getattr(engine, "kmodel", None)]
+        models = [m for m in models if m is not None]
         device = str(getattr(engine, "device", "cpu"))
-        if model is None or not device.startswith("mps"):
+        if not models or not device.startswith("mps"):
             warm_state["finished"] = True
             return  # only MPS pays per-shape compiles; CPU/CUDA need no warming
-        steps = list(warm_shape_steps(model, device, max_seconds=warm_seconds))
+        # Each model has its own decoder, so each pays its own shape compiles.
+        steps = [st for m in models for st in warm_shape_steps(m, device, max_seconds=warm_seconds)]
         warm_state["total"] = len(steps)
         t0 = time.perf_counter()
         logger.info("Warming %d MPS shapes in the background (TTS answers meanwhile)...", len(steps))
@@ -773,6 +794,9 @@ def build_app(engine: Any, stt: Any = None, warm_shapes: bool = True, warm_secon
             "tts": True,
             "stt": stt is not None,
             "speaker": speaker is not None,
+            # Which weights serve the non-Swedish languages: "base" = original
+            # Kokoro-82M (immune to Swedish training), "swedish" = the fine-tune.
+            "other_langs_weights": getattr(engine, "other_langs_weights", None),
             # False while MPS shapes are still being warmed: TTS works but a
             # novel sentence may take ~0.7 s instead of ~0.1 s.
             "warm": warm_state["finished"],
@@ -894,6 +918,13 @@ def main() -> None:
         help="warm frame counts for utterances up to this many seconds of audio (default 12)",
     )
     p.add_argument(
+        "--other-langs-weights",
+        choices=["base", "swedish"],
+        default=os.environ.get("KOKORO_OTHER_LANGS_WEIGHTS", "base"),
+        help="kokoro-svml: weights for en/fr/es/it/... — 'base' = original Kokoro-82M (default; "
+        "unaffected by Swedish fine-tuning, +~330 MB), 'swedish' = share the fine-tuned model",
+    )
+    p.add_argument(
         "--speaker",
         default=os.environ.get("SPEAKER_MODEL", "off"),
         help="speaker-verification embeddings on /v1/audio/speaker: 'ecapa' or 'off' (default off)",
@@ -918,6 +949,7 @@ def main() -> None:
             lang="auto" if args.lang == "a" else args.lang,
             allowed_langs=args.langs,
             device=args.device,
+            other_langs_weights=args.other_langs_weights,
         )
     else:
         engine = KokoroEngine(args.voice or "af_heart", args.lang)

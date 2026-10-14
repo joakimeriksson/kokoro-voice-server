@@ -68,6 +68,30 @@ Also available in base Kokoro but **off by default**: `pt` (`pf_dora`),
 `hi` (`hf_alpha`), `en-gb` (`bf_emma`), plus `ja` and `zh` — those two need
 extra g2p backends (`uv add "misaki[ja]" "misaki[zh]"`).
 
+#### Which weights speak the other languages (`--other-langs-weights`)
+
+Swedish runs on the fine-tuned model; every other language runs on the
+**original Kokoro-82M weights** by default (`--other-langs-weights base`). The
+two are separate models in one process (~330 MB extra).
+
+Why: the fine-tune was trained on Swedish only, and since it is one shared
+network that cost the other languages. Same sentences and voices, original
+Kokoro-82M vs the Swedish fine-tune, scored with Whisper small:
+
+| | transcript error | heard as that language |
+|---|---|---|
+| English | 0.000 → 0.000 | 1.00 → 0.99 |
+| French | 0.007 → 0.121 | 1.00 → 0.97 |
+| Spanish | 0.000 → 0.014 | 0.98 → 0.80 |
+| Italian | 0.012 → 0.019 | 0.95 → 0.66 |
+
+With base weights for them, the other languages are exactly original Kokoro and
+stay that way however much the Swedish model is trained later.
+`--other-langs-weights swedish` (or `$KOKORO_OTHER_LANGS_WEIGHTS`) restores the
+single shared model, e.g. for a low-memory host. `/health` reports the setting
+as `other_langs_weights`. On Apple MPS both models get the CPU-front / MPS-decoder
+split and their own shape warm-up, so warm-up takes about twice as long.
+
 ### How a language is chosen for each utterance
 
 `/v1/audio/speech` takes two optional language fields, in priority order:
