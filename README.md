@@ -51,6 +51,12 @@ history — without it conversations still work, but history stays heavy.
 Ten fine-tuned **Swedish** voice packs: `Stina` (default), `Alice`, `Ebba`,
 `Elsa`, `Greta`, `Anton`, `Björn`, `Lars`, `Nils`, `Oskar`.
 
+`--extra-voices <dir>` (or `$KOKORO_SV_EXTRA_VOICES`) adds local Swedish packs:
+any `<dir>/<Name>.pt` is usable as `"voice": "<Name>"` and takes precedence over
+the HuggingFace repo. Meant for packs not (yet) published — e.g. voices fitted
+with swedish-kokoro's `scripts/fit_voicepack.py`, which runs on the frozen model,
+so they need no new weights.
+
 `--langs` (default `sv,en,fr,es,it`, or `$KOKORO_SV_LANGS`) is the allow-list of
 languages the server may speak. A detected language outside it is **clamped to
 the first entry** — that guard is deliberate: it stops one mis-heard snippet

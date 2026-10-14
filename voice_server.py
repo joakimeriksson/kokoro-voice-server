@@ -297,7 +297,9 @@ class KokoroSVMLEngine:
         allowed_langs: str = "sv,en",
         device: str | None = None,
         other_langs_weights: str = "base",
+        extra_voices: str | None = None,
     ) -> None:
+        self._extra_voices = os.path.expanduser(extra_voices) if extra_voices else ""
         if other_langs_weights not in ("base", "swedish"):
             raise SystemExit(f"other_langs_weights must be 'base' or 'swedish', not {other_langs_weights!r}")
         if svml_path:  # override: g2p_sv from a swedish-kokoro checkout
@@ -378,11 +380,14 @@ class KokoroSVMLEngine:
         )
 
     def _sv_voicepack(self, name: str) -> Any:
-        """Lazily fetch+cache the ``voices/<name>.pt`` pack from the voices repo."""
+        """Lazily fetch+cache a Swedish pack: ``<extra-voices>/<name>.pt`` if
+        present (local packs, e.g. freshly fitted voices not yet published),
+        else ``voices/<name>.pt`` from the voices repo."""
         if name not in self._sv_voices:
             from huggingface_hub import hf_hub_download
 
-            p = hf_hub_download(self._voices_repo, f"voices/{name}.pt")
+            local = os.path.join(self._extra_voices, f"{name}.pt") if self._extra_voices else ""
+            p = local if local and os.path.isfile(local) else hf_hub_download(self._voices_repo, f"voices/{name}.pt")
             self._sv_voices[name] = self._torch.load(p, map_location=self._device, weights_only=True)
         return self._sv_voices[name]
 
@@ -918,6 +923,12 @@ def main() -> None:
         help="warm frame counts for utterances up to this many seconds of audio (default 12)",
     )
     p.add_argument(
+        "--extra-voices",
+        default=os.environ.get("KOKORO_SV_EXTRA_VOICES"),
+        help="kokoro-svml: directory of extra Swedish packs (<Name>.pt), checked before the HF "
+        "voices repo — for voices not (yet) published",
+    )
+    p.add_argument(
         "--other-langs-weights",
         choices=["base", "swedish"],
         default=os.environ.get("KOKORO_OTHER_LANGS_WEIGHTS", "base"),
@@ -950,6 +961,7 @@ def main() -> None:
             allowed_langs=args.langs,
             device=args.device,
             other_langs_weights=args.other_langs_weights,
+            extra_voices=args.extra_voices,
         )
     else:
         engine = KokoroEngine(args.voice or "af_heart", args.lang)
