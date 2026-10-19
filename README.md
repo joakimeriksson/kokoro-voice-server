@@ -57,6 +57,13 @@ the HuggingFace repo. Meant for packs not (yet) published — e.g. voices fitted
 with swedish-kokoro's `scripts/fit_voicepack.py`, which runs on the frozen model,
 so they need no new weights.
 
+A `<dir>/<Name>.pth` beside the pack gives that voice **its own model** (KModel
+format, e.g. from swedish-kokoro's `training/scripts/finetune_voice.py`). A pack
+only moves timbre — the prosody comes from the shared predictor — so a voice
+fine-tuned on its own data ships as separate weights, and the published voices
+keep `kokoro_sv.pth`. Such models load at startup (~330 MB each) and are listed
+under `voice_models` in `/health`.
+
 `--langs` (default `sv,en,fr,es,it`, or `$KOKORO_SV_LANGS`) is the allow-list of
 languages the server may speak. A detected language outside it is **clamped to
 the first entry** — that guard is deliberate: it stops one mis-heard snippet

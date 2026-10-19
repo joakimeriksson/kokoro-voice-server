@@ -368,15 +368,29 @@ class KokoroSVMLEngine:
         else:
             self._other_model = self._model
         self.kmodels = [self._model] + ([self._other_model] if self._other_model is not self._model else [])
+        # Voices with their own weights: <extra-voices>/<Name>.pth next to
+        # <Name>.pt. A pack alone only moves timbre (the prosody lives in the
+        # shared predictor), so a voice fine-tuned on its own data ships as its
+        # own model and the published voices stay on kokoro_sv.pth. Loaded up
+        # front (~330 MB each) so the MPS shape warm-up covers them too.
+        self._voice_models: dict[str, Any] = {}
+        if self._extra_voices and os.path.isdir(self._extra_voices):
+            for f in sorted(Path(self._extra_voices).glob("*.pth")):
+                m = KModel(repo_id="hexgrad/Kokoro-82M", config=cfg, model=str(f)).to(device).eval()
+                if device.startswith("mps"):
+                    install_hybrid_forward(m, device)
+                self._voice_models[f.stem] = m
+                self.kmodels.append(m)
+        self.voice_models = sorted(self._voice_models)  # reported by /health
         self._g2p = SwedishG2P(backend="neural")
         self._sv_voices: dict[str, Any] = {}  # name -> voicepack tensor (lazy, cached)
         self._pipes: dict[str, Any] = {}  # KPipeline lang_code -> pipeline (lazy, cached)
         backend = getattr(self._g2p, "backend", "?")
         logger.info(
             "KokoroSVML ready: device=%s, swedish g2p=%s, voices=%s, default sv voice=%s, langs=%s (primary %s), "
-            "other languages on %s weights",
+            "other languages on %s weights, voices with own weights: %s",
             device, backend, voices_repo, default_sv_voice, sorted(self._allowed), self._primary,
-            other_langs_weights,
+            other_langs_weights, ", ".join(self.voice_models) or "none",
         )
 
     def _sv_voicepack(self, name: str) -> Any:
@@ -447,15 +461,17 @@ class KokoroSVMLEngine:
             vp = self._sv_voicepack(name)
         except Exception:
             logger.warning("swedish voice %r not found in %s; using %s", name, self._voices_repo, self._default_sv_voice)
-            vp = self._sv_voicepack(self._default_sv_voice)
+            name = self._default_sv_voice
+            vp = self._sv_voicepack(name)
+        model = self._voice_models.get(name, self._model)
         # Digits are spelled out inside kokoro-sv's SwedishG2P (>= 0.1.2).
         ipa = self._g2p(text).replace("ʏ", "y")
-        ids = [i for i in (self._model.vocab.get(p) for p in ipa) if i is not None]
+        ids = [i for i in (model.vocab.get(p) for p in ipa) if i is not None]
         if not ids:
             return np.zeros(0, dtype=np.float32)
         torch = self._torch
         with torch.no_grad():
-            audio_t, _pred_dur = self._model.forward_with_tokens(
+            audio_t, _pred_dur = model.forward_with_tokens(
                 torch.LongTensor([[0, *ids, 0]]).to(self._device),
                 vp[len(ids) - 1].to(self._device),
                 speed=speed,
@@ -802,6 +818,8 @@ def build_app(engine: Any, stt: Any = None, warm_shapes: bool = True, warm_secon
             # Which weights serve the non-Swedish languages: "base" = original
             # Kokoro-82M (immune to Swedish training), "swedish" = the fine-tune.
             "other_langs_weights": getattr(engine, "other_langs_weights", None),
+            # Swedish voices served by their own fine-tuned weights (--extra-voices).
+            "voice_models": getattr(engine, "voice_models", []),
             # False while MPS shapes are still being warmed: TTS works but a
             # novel sentence may take ~0.7 s instead of ~0.1 s.
             "warm": warm_state["finished"],
@@ -926,7 +944,8 @@ def main() -> None:
         "--extra-voices",
         default=os.environ.get("KOKORO_SV_EXTRA_VOICES"),
         help="kokoro-svml: directory of extra Swedish packs (<Name>.pt), checked before the HF "
-        "voices repo — for voices not (yet) published",
+        "voices repo — for voices not (yet) published. A <Name>.pth beside a pack is that "
+        "voice's own fine-tuned model (KModel format)",
     )
     p.add_argument(
         "--other-langs-weights",
