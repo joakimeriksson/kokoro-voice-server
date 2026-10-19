@@ -376,7 +376,22 @@ class KokoroSVMLEngine:
         self._voice_models: dict[str, Any] = {}
         if self._extra_voices and os.path.isdir(self._extra_voices):
             for f in sorted(Path(self._extra_voices).glob("*.pth")):
-                m = KModel(repo_id="hexgrad/Kokoro-82M", config=cfg, model=str(f)).to(device).eval()
+                m = KModel(repo_id="hexgrad/Kokoro-82M", config=cfg, model=str(f))
+                # KModel loads with strict=False, so a StyleTTS2 export ("module."
+                # prefixes, parametrized weight_norm) leaves the decoder random and
+                # the voice is pure noise. Reload in KModel's key format and refuse
+                # weights it does not recognise (missing keys are fine: kokoro_sv.pth
+                # itself has no AdaIN norm affines).
+                state = self._torch.load(str(f), map_location="cpu", weights_only=True)
+                for key, sd in state.items():
+                    res = getattr(m, key).load_state_dict({
+                        (k[7:] if k.startswith("module.") else k)
+                        .replace("parametrizations.weight.original0", "weight_g")
+                        .replace("parametrizations.weight.original1", "weight_v"): v
+                        for k, v in sd.items()}, strict=False)
+                    if res.unexpected_keys:
+                        raise RuntimeError(f"{f}: {key} has unknown weights, e.g. {res.unexpected_keys[:3]}")
+                m = m.to(device).eval()
                 if device.startswith("mps"):
                     install_hybrid_forward(m, device)
                 self._voice_models[f.stem] = m
