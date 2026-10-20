@@ -108,6 +108,25 @@ single shared model, e.g. for a low-memory host. `/health` reports the setting
 as `other_langs_weights`. On Apple MPS both models get the CPU-front / MPS-decoder
 split and their own shape warm-up, so warm-up takes about twice as long.
 
+### Inline tags (voice, style, pauses, pronunciation)
+
+`input` may carry ElevenLabs-style tags; each changes what follows it:
+
+```
+[Viktor] Hej Klara! [paus 0.6] [Klara] Hej! [viskar] Kom hit… [normal] Okej.
+```
+
+| tag | effect |
+|---|---|
+| `[Klara]`, `[Viktor]`, any voice name | switch voice (and drop the style) |
+| `[viskar]` `[glad]` `[skrattar]` `[ledsen]` `[arg]` (or `whisper`, `excited`, `laughs`, `sad`, `angry`) | style: uses the pack `<Voice>_<style>` (e.g. `Klara_viskar`); a voice without it keeps its plain pack |
+| `[normal]` | back to no style, normal speed |
+| `[paus 0.8]`, `[pause]`, `<break time="1s"/>` | silence (default 0.5 s, max 5 s) |
+| `[långsamt]` `[snabbt]` `[tempo 1.1]` | speed, multiplied with the request's `speed` |
+| `[ord](/IPA/)` | pronounce one word as given (Swedish), like English Kokoro |
+
+Unknown tags are dropped, never read aloud.
+
 ### How a language is chosen for each utterance
 
 `/v1/audio/speech` takes two optional language fields, in priority order:

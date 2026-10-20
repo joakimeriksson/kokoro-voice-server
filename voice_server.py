@@ -143,6 +143,68 @@ def split_sentences(text: str, max_chars: int = 300) -> list:
     return out
 
 
+# Inline tags, ElevenLabs-style: "[Viktor] Hej! [paus 0.5] [viskar] Kom hit."
+# A tag changes the state for the text after it. Styles pick the pack
+# "<Voice>_<style>" (e.g. Klara_viskar, from a style fine-tune); a voice without
+# that pack keeps its plain pack. English aliases map to the Swedish names.
+_STYLE_TAGS = {
+    "viskar": "viskar", "viska": "viskar", "whisper": "viskar", "whispers": "viskar",
+    "glad": "glad", "excited": "glad", "happy": "glad",
+    "skrattar": "skrattar", "skratt": "skrattar", "laughs": "skrattar", "laughing": "skrattar",
+    "ledsen": "ledsen", "sad": "ledsen",
+    "arg": "arg", "angry": "arg",
+}
+_SPEED_TAGS = {"långsamt": 0.85, "slow": 0.85, "snabbt": 1.2, "fast": 1.2}
+_RESET_TAGS = {"normal", "neutral", "normalt"}
+_TAG = _re.compile(r"\[([^\]\[]{1,40})\](?!\()|<break\s+time=\"([\d.]+)(m?s)\"\s*/?>", _re.I)
+_PAUSE = _re.compile(r"(?:paus|pause)(?:\s+([\d.]+))?$", _re.I)
+_TEMPO = _re.compile(r"tempo\s+([\d.]+)$", _re.I)
+_VOICE = _re.compile(r"^[A-ZÅÄÖ][a-zåäö]+$")
+
+
+def parse_tags(text: str) -> list:
+    """Split tagged text into ("say", text, voice, style, speed) and ("pause", s).
+
+    voice None = the request's voice; speed multiplies the request's speed.
+    Unknown tags are dropped (never read aloud). A pronunciation link
+    "[ord](/IPA/)" is not a tag; the Swedish synthesizer handles it.
+    """
+    out, voice, style, speed, pos = [], None, None, 1.0, 0
+
+    def say(chunk: str) -> None:
+        if not chunk.strip():
+            return
+        if out and out[-1][0] == "say" and out[-1][2:] == (voice, style, speed):
+            out[-1] = ("say", f"{out[-1][1]} {chunk.strip()}", voice, style, speed)
+        else:
+            out.append(("say", chunk.strip(), voice, style, speed))
+
+    for m in _TAG.finditer(text):
+        say(text[pos:m.start()])
+        pos = m.end()
+        if m.group(2):  # <break time="1.5s"/>
+            out.append(("pause", float(m.group(2)) / (1000.0 if m.group(3).lower() == "ms" else 1.0)))
+            continue
+        tag = m.group(1).strip()
+        low = tag.lower()
+        if (p := _PAUSE.match(low)):
+            out.append(("pause", min(5.0, float(p.group(1) or 0.5))))
+        elif low in _STYLE_TAGS:
+            style = _STYLE_TAGS[low]
+        elif low in _SPEED_TAGS:
+            speed = _SPEED_TAGS[low]
+        elif (t := _TEMPO.match(low)):
+            speed = max(0.5, min(2.0, float(t.group(1))))
+        elif low in _RESET_TAGS:
+            style, speed = None, 1.0
+        elif _VOICE.match(tag):
+            voice, style = tag, None
+        else:
+            logger.info("dropping unknown tag [%s]", tag)
+    say(text[pos:])
+    return out
+
+
 class KokoroEngine:
     """Synthesise with Kokoro (hexgrad/Kokoro-82M), 24 kHz float audio."""
 
@@ -486,15 +548,25 @@ class KokoroSVMLEngine:
     def _synth_sv(self, text: str, voice: str | None, speed: float = 1.0) -> NDArray[np.float32]:
         # A base-Kokoro-style name (af_heart) isn't a Swedish pack -> use the default.
         name = voice if (voice and not _re.match(r"^[a-z][fm]_", voice)) else self._default_sv_voice
-        try:
-            vp = self._sv_voicepack(name)
-        except Exception:
-            logger.warning("swedish voice %r not found in %s; using %s", name, self._voices_repo, self._default_sv_voice)
-            name = self._default_sv_voice
-            vp = self._sv_voicepack(name)
-        model = self._voice_models.get(name, self._model)
+        vp = None
+        # "Klara_viskar" (a style tag) falls back to "Klara" if that voice has no such pack
+        for cand in dict.fromkeys((name, name.split("_")[0], self._default_sv_voice)):
+            try:
+                vp = self._sv_voicepack(cand)
+                break
+            except Exception:
+                logger.warning("swedish voice %r not found in %s", cand, self._voices_repo)
+        if vp is None:
+            raise RuntimeError(f"no Swedish voice pack for {name!r}")
+        base = cand.split("_")[0]
+        model = self._voice_models.get(cand) or self._voice_models.get(base, self._model)
         # Digits are spelled out inside kokoro-sv's SwedishG2P (>= 0.1.2).
-        ipa = self._g2p(text).replace("ʏ", "y")
+        # "[ord](/IPA/)" pins one word's pronunciation, as in English Kokoro.
+        pieces = _re.split(r"\[([^\]]+)\]\(/([^)/]+)/\)", text)
+        ipa = " ".join(
+            p.strip() if i % 3 == 2 else self._g2p(p).strip()
+            for i, p in enumerate(pieces) if i % 3 != 1 and p.strip()
+        ).replace("ʏ", "y")
         ids = [i for i in (model.vocab.get(p) for p in ipa) if i is not None]
         if not ids:
             return np.zeros(0, dtype=np.float32)
@@ -858,14 +930,24 @@ def build_app(engine: Any, stt: Any = None, warm_shapes: bool = True, warm_secon
     def _synth_all(body: SpeechRequest, text: str) -> Tuple[int, NDArray[np.int16]]:
         # Chunk long text by sentence: Kokoro caps at ~510 tokens/utterance, and it
         # keeps any single engine call small. Concatenate the PCM back into one WAV.
+        # Inline tags ([Viktor], [viskar], [paus 0.5], ...) switch voice, style,
+        # speed or insert silence between chunks (parse_tags).
         sample_rate = 24000
         parts = []
-        for chunk in split_sentences(text) or [text]:
-            sample_rate, pcm = engine.synth(chunk, body.voice, body.language,
-                                            body.language_hint,
-                                            max(0.5, min(2.0, body.speed or 1.0)))
-            if len(pcm):
-                parts.append(pcm)
+        base_speed = max(0.5, min(2.0, body.speed or 1.0))
+        for seg in parse_tags(text):
+            if seg[0] == "pause":
+                parts.append(np.zeros(int(seg[1] * sample_rate), dtype=np.int16))
+                continue
+            _, chunk_text, voice, style, speed = seg
+            voice = voice or body.voice
+            if style:
+                voice = f"{voice or getattr(engine, 'default_voice', '')}_{style}"
+            for chunk in split_sentences(chunk_text) or [chunk_text]:
+                sample_rate, pcm = engine.synth(chunk, voice, body.language, body.language_hint,
+                                                max(0.5, min(2.0, base_speed * speed)))
+                if len(pcm):
+                    parts.append(pcm)
         return sample_rate, (np.concatenate(parts) if parts else np.zeros(0, dtype=np.int16))
 
     @app.post("/v1/audio/speech")
