@@ -48,8 +48,9 @@ history — without it conversations still work, but history stays heavy.
 
 ### Voices, and which languages are allowed (`kokoro-svml`)
 
-Ten fine-tuned **Swedish** voice packs: `Stina` (default), `Alice`, `Ebba`,
-`Elsa`, `Greta`, `Anton`, `Björn`, `Lars`, `Nils`, `Oskar`.
+Twelve fine-tuned **Swedish** voices: `Stina` (default), `Alice`, `Ebba`,
+`Elsa`, `Greta`, `Klara`, `Anton`, `Björn`, `Lars`, `Nils`, `Oskar`, `Viktor`.
+Klara and Viktor each have their own fine-tuned model (see `--extra-voices` below).
 
 `--extra-voices <dir>` (or `$KOKORO_SV_EXTRA_VOICES`) adds local Swedish packs:
 any `<dir>/<Name>.pt` is usable as `"voice": "<Name>"` and takes precedence over
@@ -61,8 +62,10 @@ A `<dir>/<Name>.pth` beside the pack gives that voice **its own model** (KModel
 format, e.g. from swedish-kokoro's `training/scripts/finetune_voice.py`). A pack
 only moves timbre — the prosody comes from the shared predictor — so a voice
 fine-tuned on its own data ships as separate weights, and the published voices
-keep `kokoro_sv.pth`. Such models load at startup (~330 MB each) and are listed
-under `voice_models` in `/health`.
+keep `kokoro_sv.pth`. Published voices of this kind (Klara, Viktor) are named by
+a `"model"` entry in the voices repo's `voices_manifest.json` and download
+automatically; a local `.pth` overrides a published one. Such models load at
+startup (~330 MB each) and are listed under `voice_models` in `/health`.
 
 `--langs` (default `sv,en,fr,es,it`, or `$KOKORO_SV_LANGS`) is the allow-list of
 languages the server may speak. A detected language outside it is **clamped to

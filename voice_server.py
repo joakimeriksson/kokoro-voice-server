@@ -32,6 +32,7 @@ Then point the client app at it:
 """
 
 import io
+import json
 import os
 import sys
 import logging
@@ -368,34 +369,47 @@ class KokoroSVMLEngine:
         else:
             self._other_model = self._model
         self.kmodels = [self._model] + ([self._other_model] if self._other_model is not self._model else [])
-        # Voices with their own weights: <extra-voices>/<Name>.pth next to
-        # <Name>.pt. A pack alone only moves timbre (the prosody lives in the
-        # shared predictor), so a voice fine-tuned on its own data ships as its
-        # own model and the published voices stay on kokoro_sv.pth. Loaded up
-        # front (~330 MB each) so the MPS shape warm-up covers them too.
-        self._voice_models: dict[str, Any] = {}
+        # Voices with their own weights. A pack alone only moves timbre (the
+        # prosody lives in the shared predictor), so a voice fine-tuned on its
+        # own data ships as its own model and the other voices stay on
+        # kokoro_sv.pth. Published ones are named by "model" in the repo's
+        # voices_manifest.json; <extra-voices>/<Name>.pth next to <Name>.pt
+        # adds or overrides one locally. Loaded up front (~330 MB each) so the
+        # MPS shape warm-up covers them too.
+        model_files: dict[str, str] = {}
+        try:
+            manifest = json.loads(Path(hf_hub_download(voices_repo, "voices_manifest.json")).read_text("utf-8"))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("no voices_manifest.json in %s (%s); no published per-voice models", voices_repo, e)
+            manifest = {}
+        for name, info in manifest.items():
+            if isinstance(info, dict) and info.get("model"):
+                model_files[name] = hf_hub_download(voices_repo, info["model"])
         if self._extra_voices and os.path.isdir(self._extra_voices):
             for f in sorted(Path(self._extra_voices).glob("*.pth")):
-                m = KModel(repo_id="hexgrad/Kokoro-82M", config=cfg, model=str(f))
-                # KModel loads with strict=False, so a StyleTTS2 export ("module."
-                # prefixes, parametrized weight_norm) leaves the decoder random and
-                # the voice is pure noise. Reload in KModel's key format and refuse
-                # weights it does not recognise (missing keys are fine: kokoro_sv.pth
-                # itself has no AdaIN norm affines).
-                state = self._torch.load(str(f), map_location="cpu", weights_only=True)
-                for key, sd in state.items():
-                    res = getattr(m, key).load_state_dict({
-                        (k[7:] if k.startswith("module.") else k)
-                        .replace("parametrizations.weight.original0", "weight_g")
-                        .replace("parametrizations.weight.original1", "weight_v"): v
-                        for k, v in sd.items()}, strict=False)
-                    if res.unexpected_keys:
-                        raise RuntimeError(f"{f}: {key} has unknown weights, e.g. {res.unexpected_keys[:3]}")
-                m = m.to(device).eval()
-                if device.startswith("mps"):
-                    install_hybrid_forward(m, device)
-                self._voice_models[f.stem] = m
-                self.kmodels.append(m)
+                model_files[f.stem] = str(f)
+        self._voice_models: dict[str, Any] = {}
+        for name, f in sorted(model_files.items()):
+            m = KModel(repo_id="hexgrad/Kokoro-82M", config=cfg, model=f)
+            # KModel loads with strict=False, so a StyleTTS2 export ("module."
+            # prefixes, parametrized weight_norm) leaves the decoder random and
+            # the voice is pure noise. Reload in KModel's key format and refuse
+            # weights it does not recognise (missing keys are fine: kokoro_sv.pth
+            # itself has no AdaIN norm affines).
+            state = self._torch.load(f, map_location="cpu", weights_only=True)
+            for key, sd in state.items():
+                res = getattr(m, key).load_state_dict({
+                    (k[7:] if k.startswith("module.") else k)
+                    .replace("parametrizations.weight.original0", "weight_g")
+                    .replace("parametrizations.weight.original1", "weight_v"): v
+                    for k, v in sd.items()}, strict=False)
+                if res.unexpected_keys:
+                    raise RuntimeError(f"{f}: {key} has unknown weights, e.g. {res.unexpected_keys[:3]}")
+            m = m.to(device).eval()
+            if device.startswith("mps"):
+                install_hybrid_forward(m, device)
+            self._voice_models[name] = m
+            self.kmodels.append(m)
         self.voice_models = sorted(self._voice_models)  # reported by /health
         self._g2p = SwedishG2P(backend="neural")
         self._sv_voices: dict[str, Any] = {}  # name -> voicepack tensor (lazy, cached)
