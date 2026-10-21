@@ -37,6 +37,7 @@ import os
 import sys
 import logging
 import argparse
+import time
 from typing import Any, Tuple
 from pathlib import Path
 
@@ -144,15 +145,18 @@ def split_sentences(text: str, max_chars: int = 300) -> list:
 
 
 # Inline tags, ElevenLabs-style: "[Viktor] Hej! [paus 0.5] [viskar] Kom hit."
-# A tag changes the state for the text after it. Styles pick the pack
-# "<Voice>_<style>" (e.g. Klara_viskar, from a style fine-tune); a voice without
-# that pack keeps its plain pack. English aliases map to the Swedish names.
+# A tag changes the state for the text after it. A styled line goes to VoxCPM2
+# when the voice has a --vox-voice reference (see VoxEngine); otherwise Kokoro
+# uses the pack "<Voice>_<style>" if one exists, else the plain pack. English
+# aliases map to the Swedish names; any other tag is a free description for
+# VoxCPM2 ("[sarcastic]") and is never read aloud.
 _STYLE_TAGS = {
     "viskar": "viskar", "viska": "viskar", "whisper": "viskar", "whispers": "viskar",
     "glad": "glad", "excited": "glad", "happy": "glad",
     "skrattar": "skrattar", "skratt": "skrattar", "laughs": "skrattar", "laughing": "skrattar",
     "ledsen": "ledsen", "sad": "ledsen",
     "arg": "arg", "angry": "arg",
+    "tänker": "tänker", "thinking": "tänker",
 }
 _SPEED_TAGS = {"långsamt": 0.85, "slow": 0.85, "snabbt": 1.2, "fast": 1.2}
 _RESET_TAGS = {"normal", "neutral", "normalt"}
@@ -166,8 +170,9 @@ def parse_tags(text: str) -> list:
     """Split tagged text into ("say", text, voice, style, speed) and ("pause", s).
 
     voice None = the request's voice; speed multiplies the request's speed.
-    Unknown tags are dropped (never read aloud). A pronunciation link
-    "[ord](/IPA/)" is not a tag; the Swedish synthesizer handles it.
+    An unknown tag becomes a free-text style (lowercased) for VoxCPM2; no tag
+    is ever read aloud. A pronunciation link "[ord](/IPA/)" is not a tag; the
+    Swedish synthesizer handles it.
     """
     out, voice, style, speed, pos = [], None, None, 1.0, 0
 
@@ -200,7 +205,7 @@ def parse_tags(text: str) -> list:
         elif _VOICE.match(tag):
             voice, style = tag, None
         else:
-            logger.info("dropping unknown tag [%s]", tag)
+            style = low
     say(text[pos:])
     return out
 
@@ -628,6 +633,182 @@ class KokoroSVMLEngine:
         return 24000, pcm
 
 
+class VoxEngine:
+    """Expressive speech with VoxCPM2 (openbmb, 2.4B) through MLX, Apple Silicon only.
+
+    Kokoro stays the everyday voice (~0.1 s a sentence); lines carrying a style
+    tag ([skrattar], [arg], [viskar], ... or any free description) go here,
+    where laughter, whispering and anger are real rather than a nudged style
+    vector (the Kokoro style fine-tunes were inaudible, Oct 2026). A voice is a
+    VoxCPM2 reference clip; Klara and Viktor are cloned from the takes their
+    Kokoro voices were distilled from, so both engines sound like one person.
+
+    8-bit weights at 5 diffusion steps: 12/12 short sentences correct by
+    Whisper vs 10/12 for 4-bit (it garbled "Ja, Plopp har vi!"), ~0.5 s a short
+    sentence on an M5 Max, ~6 GB. More steps were not more reliable.
+
+    MLX arrays belong to the thread that made them, so load() and every
+    synth() must run on the same thread: the server's TTS thread.
+    """
+
+    SAMPLE_RATE = 24000  # resampled from VoxCPM2's 48 kHz to match Kokoro
+    # Style tag -> VoxCPM2 instruction. Any other tag is passed on verbatim, so
+    # "[sarcastic]" or "[talking like a pirate]" work too.
+    INSTRUCT = {
+        "viskar": "whispering softly, very quiet",
+        "glad": "happy and excited, bright and lively",
+        "skrattar": "laughing while speaking, amused",
+        "ledsen": "sad and subdued, slow and quiet",
+        "arg": "angry and stern, raised voice",
+        "tänker": "thinking out loud, hesitant and soft",
+    }
+    # Said "while thinking", so the listener hears the robot react the moment
+    # they stop talking and the reply can start ~1 s later.
+    FILLERS = {
+        "sv": ["Hmm…", "Mm, vänta lite…", "Ja, okej…", "Okej…", "Öh, vänta…", "Mm…"],
+        "en": ["Hmm…", "Mm, let me see…", "Okay…", "Uh, one sec…", "Right…", "Mm…"],
+        "de": ["Hmm…", "Mal sehen…", "Okay…", "Moment…", "Mm…"],
+        "fr": ["Hmm…", "Euh, voyons…", "D'accord…", "Alors…", "Mm…"],
+        "es": ["Mmm…", "A ver…", "Vale…", "Bueno…", "Mm…"],
+        "it": ["Mmm…", "Vediamo…", "Allora…", "Okay…", "Mm…"],
+    }
+
+    def __init__(self, voices: dict, repo: str = "mlx-community/VoxCPM2-8bit", steps: int = 5,
+                 cache_dir: str | None = None, filler_langs: str = "sv,en,de,fr,es,it") -> None:
+        self.voices = {name: str(Path(p).expanduser()) for name, p in voices.items()}
+        for name, path in self.voices.items():
+            if not Path(path).is_file():
+                raise SystemExit(f"--vox-voice {name}: no such file {path}")
+        self.repo, self.steps = repo, steps
+        self.cache_dir = Path(cache_dir or "~/.cache/kokoro-voice-server/vox").expanduser()
+        self.filler_langs = [x.strip() for x in filler_langs.split(",") if x.strip() in self.FILLERS]
+        self.model: Any = None
+        self.fillers: dict = {}   # (voice, lang) -> [int16 pcm]
+        self._recent: dict = {}   # (voice, lang) -> index played last
+        self._cache: dict = {}    # (voice, instruct, text) -> int16 pcm, short lines only
+        # (pcm, lang) -> transcript, set by the server when Whisper is on; used
+        # to throw away fillers that say something else ("Okej…" came out as
+        # "Ja, ja, vad är det?").
+        self.transcribe: Any = None
+
+    def load(self) -> None:
+        import mlx.core as mx
+        from mlx_audio.tts.utils import load
+
+        # MLX keeps freed buffers for reuse, and every new sentence length
+        # frees buffers of new sizes. The default cap is ~the whole machine:
+        # the server grew 3 GB a request to 134 GB and swapped (Oct 2026).
+        # 2 GB holds it at ~6 GB with no loss of speed (RTF 0.26 either way).
+        mx.set_cache_limit(2 * 1024**3)
+        t0 = time.perf_counter()
+        self.model = load(self.repo)
+        ref = next(iter(self.voices.values()))
+        next(self.model.generate(text="Hej.", ref_audio=ref, inference_timesteps=self.steps))  # warm-up
+        logger.info("VoxCPM2 %s loaded in %.1f s, voices %s", self.repo, time.perf_counter() - t0,
+                    ", ".join(self.voices))
+
+    def has_voice(self, voice: str | None) -> bool:
+        return bool(voice) and voice.split("_")[0] in self.voices
+
+    def _generate(self, text: str, ref: str, instruct: str | None) -> NDArray[np.float32]:
+        from scipy.signal import resample_poly
+
+        r = next(self.model.generate(text=text, instruct=instruct, ref_audio=ref,
+                                     inference_timesteps=self.steps))
+        audio = np.asarray(r.audio, dtype=np.float32).reshape(-1)
+        return resample_poly(audio, self.SAMPLE_RATE, r.sample_rate).astype(np.float32)
+
+    def synth(self, text: str, voice: str, style: str | None = None) -> Tuple[int, NDArray[np.int16]]:
+        """*voice* is a --vox-voice name (a "_style" suffix is ignored); *style*
+        a style tag or a free English description of how to say it."""
+        if self.model is None:
+            self.load()
+        voice = voice.split("_")[0]
+        instruct = self.INSTRUCT.get(style, style) if style else None
+        key = (voice, instruct, text)
+        if key in self._cache:
+            return self.SAMPLE_RATE, self._cache[key]
+        pcm = self._take(text, voice, instruct)
+        if len(text) <= 60:
+            if len(self._cache) >= 256:
+                self._cache.pop(next(iter(self._cache)))
+            self._cache[key] = pcm
+        return self.SAMPLE_RATE, pcm
+
+    def _take(self, text: str, voice: str, instruct: str | None) -> NDArray[np.int16]:
+        audio = self._generate(text, self.voices[voice], instruct)
+        # Now and then VoxCPM2 runs on: babble after the words, or seconds of
+        # "mm" for "Mm." Speech is ~14 chars/s; far beyond that, try once more
+        # and keep the shorter take.
+        limit = 1.5 + 0.2 * len(text)
+        if len(audio) / self.SAMPLE_RATE > limit:
+            again = self._generate(text, self.voices[voice], instruct)
+            logger.info("vox: %.1f s for %r (limit %.1f), retried: %.1f s", len(audio) / self.SAMPLE_RATE,
+                        text[:40], limit, len(again) / self.SAMPLE_RATE)
+            audio = min(audio, again, key=len)
+        return (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
+
+    # --- thinking fillers ---------------------------------------------------
+
+    def filler_jobs(self) -> list:
+        """One callable per missing filler (run each on the TTS thread). Takes
+        already on disk are loaded at once; delete a bad one there to redo it."""
+        import soundfile as sf
+
+        jobs = []
+        for voice in self.voices:
+            for lang in self.filler_langs:
+                bank = self.fillers.setdefault((voice, lang), [])
+                for i, text in enumerate(self.FILLERS[lang]):
+                    path = self.cache_dir / "fillers" / voice / lang / f"{i:02d}.wav"
+                    if path.is_file():
+                        bank.append(sf.read(str(path), dtype="int16")[0])
+                    else:
+                        jobs.append(lambda v=voice, l=lang, t=text, p=path: self._make_filler(v, l, t, p))
+        return jobs
+
+    @staticmethod
+    def _words(text: str) -> str:
+        return " ".join(_re.sub(r"[^\w\s]", " ", text.lower()).split())
+
+    def _heard(self, pcm: NDArray[np.int16], lang: str, text: str) -> bool:
+        """Whisper hears every word of *text* (letter-level similarity is too
+        lax for one-word fillers: "Ave" is 75% "A ver"). Hums ("Hmm…", "Mm…")
+        always pass: Whisper writes those any old way."""
+        want = [w for w in self._words(text).split() if not _re.fullmatch(r"[hmueö]+", w)]
+        if self.transcribe is None or not want:
+            return True
+        heard = self._words(self.transcribe(pcm, lang)).split()
+        return all(w in heard for w in want)
+
+    def _make_filler(self, voice: str, lang: str, text: str, path: Path) -> None:
+        import soundfile as sf
+
+        for _ in range(3):
+            pcm = self._take(text, voice, self.INSTRUCT["tänker"])
+            # a filler that drags is worse than none
+            if len(pcm) <= self.SAMPLE_RATE * 2.5 and self._heard(pcm, lang, text):
+                break
+        else:
+            logger.info("vox: no good take of filler %r (%s/%s)", text, voice, lang)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        sf.write(str(path), pcm, self.SAMPLE_RATE, subtype="PCM_16")
+        self.fillers.setdefault((voice, lang), []).append(pcm)
+
+    def filler(self, voice: str, lang: str) -> NDArray[np.int16] | None:
+        """A random filler for *voice* in *lang*, never the same twice in a row."""
+        import random
+
+        bank = self.fillers.get((voice.split("_")[0], lang)) or []
+        if not bank:
+            return None
+        choices = [i for i in range(len(bank)) if i != self._recent.get((voice, lang))] or [0]
+        i = random.choice(choices)
+        self._recent[(voice, lang)] = i
+        return bank[i]
+
+
 # --- Apple MPS: split the model, warm the decoder ---------------------------
 #
 # On MPS every NEW tensor shape costs a graph compile: measured on an M5 Max,
@@ -645,8 +826,23 @@ class KokoroSVMLEngine:
 # one small decoder forward per frame count, ~0.3 s each the first time ever,
 # ~0.05 s from the OS cache — done in the background at startup. Result:
 # novel sentences synthesize in ~0.1-0.2 s flat instead of 0.4-0.8 s.
+#
+# Memory: each warmed frame count also kept ~30 MB of MPS buffers alive, so
+# warming 8-480 frames for two voice models held 65 GB (found Oct 2026, hidden
+# in swap). torch.mps.empty_cache() after every step and every request drops
+# the buffers but keeps what made warming worth it: the shader compiles, which
+# macOS caches on disk. A novel length then costs ~0.19 s instead of ~1 s cold
+# (0.07 s with buffers kept), and the server stays at ~5 GB.
 # Kokoro: 24 kHz, 600 samples per frame → 40 frames per second of speech.
 WARM_FRAMES_PER_SECOND = 40
+
+
+def release_mps_buffers() -> None:
+    """Give torch's cached MPS buffers back to the system (see above)."""
+    import torch
+
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
 
 def install_hybrid_forward(model: Any, gpu: str) -> None:
@@ -714,6 +910,7 @@ def warm_shape_steps(model: Any, device: str, max_seconds: float = 12.0):
                     torch.zeros(1, 2 * F, device=device),
                     spk,
                 )
+            release_mps_buffers()
         return run
 
     # Short replies (few frames) first so the common case warms earliest.
@@ -817,7 +1014,7 @@ class SpeakerEncoder:
 
 
 def build_app(engine: Any, stt: Any = None, warm_shapes: bool = True, warm_seconds: float = 12.0,
-              speaker: Any = None) -> Any:
+              speaker: Any = None, vox: Any = None) -> Any:
     import time
     import asyncio
     import threading
@@ -859,6 +1056,7 @@ def build_app(engine: Any, stt: Any = None, warm_shapes: bool = True, warm_secon
     app = FastAPI(title="kokoro voice server")
 
     warm_state = {"done": 0, "total": 0, "finished": not warm_shapes}
+    mps = str(getattr(engine, "device", "cpu")).startswith("mps")
 
     def _warm_in_background() -> None:
         """Run warm_shape_steps on the TTS thread, one step at a time.
@@ -896,8 +1094,40 @@ def build_app(engine: Any, stt: Any = None, warm_shapes: bool = True, warm_secon
         warm_state["finished"] = True
         logger.info("MPS shape warm-up done: %d shapes in %.0f s", warm_state["done"], time.perf_counter() - t0)
 
+    if vox is not None and stt is not None:
+        def _vox_transcribe(pcm: NDArray[np.int16], lang: str) -> str:
+            # Beam search and no robot prompt: one-word clips need all the help
+            # (greedy base Whisper hears a good "Vale" as "¡Morale!").
+            def run() -> str:
+                segments, _ = stt._model.transcribe(io.BytesIO(wav), language=lang, beam_size=5)
+                return " ".join(seg.text for seg in segments)
+            wav, _ = _to_audio_bytes(vox.SAMPLE_RATE, pcm, "wav")
+            return stt_pool.submit(run).result()
+        vox.transcribe = _vox_transcribe
+
+    def _vox_in_background() -> None:
+        """Load VoxCPM2 and render the missing fillers, on the TTS thread one
+        job at a time so requests keep being served in between."""
+        try:
+            tts_pool.submit(vox.load).result()
+        except Exception as exc:
+            logger.error("VoxCPM2 failed to load, styled lines fall back to Kokoro: %s", exc)
+            return
+        jobs = vox.filler_jobs()
+        t0 = time.perf_counter()
+        for job in jobs:
+            try:
+                tts_pool.submit(job).result()
+            except Exception as exc:
+                logger.warning("filler failed: %s", exc)
+        logger.info("Fillers ready: %s (%d new in %.0f s)",
+                    {f"{v}/{l}": len(b) for (v, l), b in vox.fillers.items()}, len(jobs),
+                    time.perf_counter() - t0)
+
     @app.on_event("startup")
     async def _start_warmup() -> None:
+        if vox is not None:
+            threading.Thread(target=_vox_in_background, name="vox-load", daemon=True).start()
         if warm_shapes:
             threading.Thread(target=_warm_in_background, name="warm-shapes", daemon=True).start()
 
@@ -921,6 +1151,10 @@ def build_app(engine: Any, stt: Any = None, warm_shapes: bool = True, warm_secon
             "other_langs_weights": getattr(engine, "other_langs_weights", None),
             # Swedish voices served by their own fine-tuned weights (--extra-voices).
             "voice_models": getattr(engine, "voice_models", []),
+            # Voices VoxCPM2 speaks styled lines in, and whether it has loaded.
+            "vox_voices": sorted(vox.voices) if vox is not None else [],
+            "vox_loaded": vox is not None and vox.model is not None,
+            "fillers": {f"{v}/{l}": len(b) for (v, l), b in vox.fillers.items()} if vox is not None else {},
             # False while MPS shapes are still being warmed: TTS works but a
             # novel sentence may take ~0.7 s instead of ~0.1 s.
             "warm": warm_state["finished"],
@@ -935,17 +1169,26 @@ def build_app(engine: Any, stt: Any = None, warm_shapes: bool = True, warm_secon
         sample_rate = 24000
         parts = []
         base_speed = max(0.5, min(2.0, body.speed or 1.0))
+        # model "voxcpm2" sends untagged lines to VoxCPM2 as well.
+        all_vox = (body.model or "").lower().startswith("vox")
         for seg in parse_tags(text):
             if seg[0] == "pause":
                 parts.append(np.zeros(int(seg[1] * sample_rate), dtype=np.int16))
                 continue
             _, chunk_text, voice, style, speed = seg
-            voice = voice or body.voice
-            if style:
-                voice = f"{voice or getattr(engine, 'default_voice', '')}_{style}"
+            voice = voice or body.voice or getattr(engine, "default_voice", "")
+            use_vox = (vox is not None and vox.model is not None and vox.has_voice(voice)
+                       and (style or all_vox))
+            if style and not use_vox:
+                voice = f"{voice}_{style}"
             for chunk in split_sentences(chunk_text) or [chunk_text]:
-                sample_rate, pcm = engine.synth(chunk, voice, body.language, body.language_hint,
-                                                max(0.5, min(2.0, base_speed * speed)))
+                if use_vox:
+                    sample_rate, pcm = vox.synth(chunk, voice, style)
+                else:
+                    sample_rate, pcm = engine.synth(chunk, voice, body.language, body.language_hint,
+                                                    max(0.5, min(2.0, base_speed * speed)))
+                    if mps:
+                        release_mps_buffers()
                 if len(pcm):
                     parts.append(pcm)
         return sample_rate, (np.concatenate(parts) if parts else np.zeros(0, dtype=np.int16))
@@ -965,6 +1208,19 @@ def build_app(engine: Any, stt: Any = None, warm_shapes: bool = True, warm_secon
             (time.perf_counter() - t0) * 1000, len(pcm) / sample_rate,
             body.language or "-", body.language_hint or "-", text[:60],
         )
+        return Response(content=audio, media_type=media)
+
+    @app.get("/v1/audio/filler")
+    def filler(voice: str | None = None, language: str = "sv", response_format: str = "wav") -> Response:
+        """A short pre-rendered "hmm…"/"mm, vänta lite…" in *voice* and
+        *language*, to play the moment the user stops talking while the reply
+        is being thought up and voiced. Served from memory, so it never waits
+        for the TTS thread. 204 when there is none (no VoxCPM2, or not ready)."""
+        pcm = vox.filler(voice or getattr(engine, "default_voice", ""), _norm_lang(language)) \
+            if vox is not None else None
+        if pcm is None:
+            return Response(status_code=204)
+        audio, media = _to_audio_bytes(vox.SAMPLE_RATE, pcm, response_format)
         return Response(content=audio, media_type=media)
 
     @app.post("/v1/audio/transcriptions")
@@ -1075,6 +1331,19 @@ def main() -> None:
         default=os.environ.get("WHISPER_MODEL", "off"),
         help="faster-whisper size for /v1/audio/transcriptions (tiny/base/small/medium), or 'off'",
     )
+    p.add_argument(
+        "--vox-voice", action="append", default=[], metavar="NAME=WAV",
+        help="speak styled lines ([skrattar], [arg], [viskar], ...) for voice NAME with VoxCPM2, "
+        "cloned from the reference clip WAV (repeatable). Needs Apple Silicon and the 'vox' "
+        "extra (uv sync --extra vox). Also enables /v1/audio/filler for that voice",
+    )
+    p.add_argument("--vox-model", default="mlx-community/VoxCPM2-8bit",
+                   help="MLX VoxCPM2 weights (default 8-bit; 4-bit garbles short sentences)")
+    p.add_argument("--vox-steps", type=int, default=5, help="VoxCPM2 diffusion steps (default 5)")
+    p.add_argument("--vox-cache", default=None,
+                   help="where rendered fillers are kept (default ~/.cache/kokoro-voice-server/vox)")
+    p.add_argument("--filler-langs", default="sv,en,de,fr,es,it",
+                   help="languages to render thinking fillers in (default sv,en,de,fr,es,it)")
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 
@@ -1106,10 +1375,19 @@ def main() -> None:
         "Voice server: engine=%s whisper=%s on %s:%d", args.engine, args.whisper, args.host, args.port
     )
 
+    vox = None
+    if args.vox_voice:
+        try:
+            voices = dict(v.split("=", 1) for v in args.vox_voice)
+        except ValueError:
+            raise SystemExit("--vox-voice wants NAME=WAV")
+        vox = VoxEngine(voices, repo=args.vox_model, steps=args.vox_steps, cache_dir=args.vox_cache,
+                        filler_langs=args.filler_langs)
+
     import uvicorn
 
     app = build_app(engine, stt, warm_shapes=not args.no_warm_shapes, warm_seconds=args.warm_seconds,
-                    speaker=speaker)
+                    speaker=speaker, vox=vox)
     if args.host in ("::", "dual"):
         # Serve BOTH stacks from one socket. uvicorn's own "::" bind is v6-only
         # here, and that breaks clients that resolve this host to IPv4 — a robot

@@ -119,13 +119,54 @@ split and their own shape warm-up, so warm-up takes about twice as long.
 | tag | effect |
 |---|---|
 | `[Klara]`, `[Viktor]`, any voice name | switch voice (and drop the style) |
-| `[viskar]` `[glad]` `[skrattar]` `[ledsen]` `[arg]` (or `whisper`, `excited`, `laughs`, `sad`, `angry`) | style: uses the pack `<Voice>_<style>` (e.g. `Klara_viskar`); a voice without it keeps its plain pack |
+| `[viskar]` `[glad]` `[skrattar]` `[ledsen]` `[arg]` `[tänker]` (or `whisper`, `excited`, `laughs`, `sad`, `angry`, `thinking`) | style: spoken by VoxCPM2 when the voice has a `--vox-voice` (below); otherwise the Kokoro pack `<Voice>_<style>` if there is one, else the plain pack |
+| any other tag, e.g. `[sarcastic]`, `[talking like a pirate]` | a free description of how to say it, for VoxCPM2 voices |
 | `[normal]` | back to no style, normal speed |
 | `[paus 0.8]`, `[pause]`, `<break time="1s"/>` | silence (default 0.5 s, max 5 s) |
 | `[långsamt]` `[snabbt]` `[tempo 1.1]` | speed, multiplied with the request's `speed` |
 | `[ord](/IPA/)` | pronounce one word as given (Swedish), like English Kokoro |
 
-Unknown tags are dropped, never read aloud.
+No tag is ever read aloud.
+
+### Expressive lines with VoxCPM2 (`--vox-voice`, Apple Silicon)
+
+Kokoro cannot laugh, whisper or shout: its style packs barely change the
+sound. [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) can, so styled lines
+go to it while everything else stays on Kokoro:
+
+```bash
+uv sync --extra vox     # mlx-audio; macOS on Apple Silicon only
+uv run python voice_server.py --engine kokoro-svml --voice Klara --whisper base \
+    --vox-voice Klara=refs/klara.wav --vox-voice Viktor=refs/viktor.wav
+```
+
+`--vox-voice NAME=WAV` clones voice NAME from a reference clip (use the take
+the Kokoro voice was distilled from, so both engines sound like one person).
+Then `[skrattar] Haha, nej!` in Klara's voice is real laughter. A request with
+`"model": "voxcpm2"` sends untagged lines there too.
+
+- **Speed:** 8-bit weights, 5 diffusion steps: ~0.5-0.7 s per sentence on an
+  M5 Max (Kokoro: ~0.25 s). Send one sentence per request and play each while
+  the next is made. 4-bit weights garble short sentences; more steps don't help.
+- **Memory:** ~6 GB more. MLX's buffer cache is capped at 2 GB; uncapped it
+  grew 3 GB per request.
+
+#### Thinking fillers (`GET /v1/audio/filler`)
+
+Something to play the moment the user stops talking, while the reply is still
+being thought up and voiced:
+
+```bash
+curl -o hmm.wav "localhost:8880/v1/audio/filler?voice=Klara&language=sv"
+```
+
+returns a random "Hmm…", "Mm, vänta lite…", "Ja, okej…" (never the same twice
+in a row) in 1-2 ms, straight from memory; `204` if the voice has none. Fillers
+are rendered once per `--vox-voice` in `--filler-langs` (default
+`sv,en,de,fr,es,it`) at startup and kept in `--vox-cache`
+(`~/.cache/kokoro-voice-server/vox/fillers/<voice>/<lang>/NN.wav`). With
+`--whisper` on, each take is transcribed and redone (up to 3 tries) unless every
+word is heard. Delete a file you don't like and restart to get a new take.
 
 ### How a language is chosen for each utterance
 

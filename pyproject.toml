@@ -33,6 +33,11 @@ dependencies = [
 Homepage = "https://github.com/joakimeriksson/kokoro-voice-server"
 Voices = "https://huggingface.co/Joakim/kokoro-sv-voices"
 
+[project.optional-dependencies]
+vox = [
+    "mlx-audio>=0.5.4 ; platform_machine == 'arm64' and sys_platform == 'darwin'",
+]
+
 [tool.uv.sources]
 kokoro-sv = { git = "https://github.com/joakimeriksson/kokoro-sv" }
 en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }
