@@ -160,7 +160,7 @@ _STYLE_TAGS = {
 }
 _SPEED_TAGS = {"långsamt": 0.85, "slow": 0.85, "snabbt": 1.2, "fast": 1.2}
 _RESET_TAGS = {"normal", "neutral", "normalt"}
-_TAG = _re.compile(r"\[([^\]\[]{1,40})\](?!\()|<break\s+time=\"([\d.]+)(m?s)\"\s*/?>", _re.I)
+_TAG = _re.compile(r"\[([^\]\[]{1,80})\](?!\()|<break\s+time=\"([\d.]+)(m?s)\"\s*/?>", _re.I)
 _PAUSE = _re.compile(r"(?:paus|pause)(?:\s+([\d.]+))?$", _re.I)
 _TEMPO = _re.compile(r"tempo\s+([\d.]+)$", _re.I)
 _VOICE = _re.compile(r"^[A-ZÅÄÖ][a-zåäö]+$")
