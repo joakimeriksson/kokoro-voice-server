@@ -596,10 +596,8 @@ class KokoroSVMLEngine:
         ]
         return np.concatenate(chunks).astype(np.float32) if chunks else np.zeros(0, dtype=np.float32)
 
-    def synth(
-        self, text: str, voice: str | None, language: str | None = None,
-        language_hint: str | None = None, speed: float = 1.0
-    ) -> Tuple[int, NDArray[np.int16]]:
+    def resolve_lang(self, text: str, language: str | None = None, language_hint: str | None = None) -> str:
+        """The language *text* will be spoken in (explicit > detected > hint > primary)."""
         hint = _norm_lang(language_hint)
         hint = hint if hint in self._allowed else ""
         # An explicit, allowed language from the caller (e.g. the STT-detected
@@ -625,6 +623,13 @@ class KokoroSVMLEngine:
         # The conversation's own language beats the static primary here too.
         if lang not in self._allowed:
             lang = hint or self._primary
+        return lang
+
+    def synth(
+        self, text: str, voice: str | None, language: str | None = None,
+        language_hint: str | None = None, speed: float = 1.0
+    ) -> Tuple[int, NDArray[np.int16]]:
+        lang = self.resolve_lang(text, language, language_hint)
         if lang in ("sv", "swedish", "se"):
             audio = self._synth_sv(text, voice, speed)
         else:
@@ -1177,8 +1182,14 @@ def build_app(engine: Any, stt: Any = None, warm_shapes: bool = True, warm_secon
                 continue
             _, chunk_text, voice, style, speed = seg
             voice = voice or body.voice or getattr(engine, "default_voice", "")
-            use_vox = (vox is not None and vox.model is not None and vox.has_voice(voice)
-                       and (style or all_vox))
+            has_vox = vox is not None and vox.model is not None and vox.has_voice(voice)
+            # The fine-tuned Kokoro voices only speak Swedish; anything else would fall
+            # back to a stock Kokoro voice (a woman, for English). A voice with a VoxCPM2
+            # clone speaks every other language as itself instead.
+            foreign = (has_vox and not style and not all_vox and hasattr(engine, "resolve_lang")
+                       and engine.resolve_lang(chunk_text, body.language, body.language_hint)
+                       not in ("sv", "swedish", "se"))
+            use_vox = has_vox and bool(style or all_vox or foreign)
             if style and not use_vox:
                 voice = f"{voice}_{style}"
             for chunk in split_sentences(chunk_text) or [chunk_text]:
