@@ -707,10 +707,29 @@ class VoxEngine:
         mx.set_cache_limit(2 * 1024**3)
         t0 = time.perf_counter()
         self.model = load(self.repo)
+        self._cache_reference_encoding()
         ref = next(iter(self.voices.values()))
         next(self.model.generate(text="Hej.", ref_audio=ref, inference_timesteps=self.steps))  # warm-up
         logger.info("VoxCPM2 %s loaded in %.1f s, voices %s", self.repo, time.perf_counter() - t0,
                     ", ".join(self.voices))
+
+    def _cache_reference_encoding(self) -> None:
+        """mlx_audio re-reads and VAE-encodes the reference clip on EVERY
+        sentence (~115 ms for a 7 s clip on an M5 Max). The clips never
+        change, so encode each once. Same thread as synth(), as MLX needs."""
+        orig = self.model._encode_wav
+        cache: dict = {}
+
+        def encode(audio_input, padding_mode="right", trim_silence_vad=False):
+            if not isinstance(audio_input, str):
+                return orig(audio_input, padding_mode=padding_mode, trim_silence_vad=trim_silence_vad)
+            key = (audio_input, padding_mode, trim_silence_vad)
+            if key not in cache:
+                cache[key] = orig(audio_input, padding_mode=padding_mode,
+                                  trim_silence_vad=trim_silence_vad)
+            return cache[key]
+
+        self.model._encode_wav = encode
 
     def has_voice(self, voice: str | None) -> bool:
         return bool(voice) and voice.split("_")[0] in self.voices
